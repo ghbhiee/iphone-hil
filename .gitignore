@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 本机配置：含 BLE 口令、标定结果、指针阈值（用 hil.example.json 作模板）
+hil.json
+
+# 截图、服务日志：全是用户手机上的内容，绝不入库
+captures/*
+!captures/.keep
+
+# 固件编译产物（prebuilt/ 里放经真机验证的二进制）
+firmware/build/
+firmware/hid_bridge/build/
+
+# macOS
+.DS_Store

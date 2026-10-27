@@ -1,0 +1,6 @@
+park
+tap 200 400
+type hello
+key GUI+H
+wait 0
+done

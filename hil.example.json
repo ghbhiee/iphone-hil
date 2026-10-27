@@ -1,0 +1,65 @@
+{
+ "_comment": "复制为 hil.json。ble_token 填固件串口 ST 回复里的 token=；pointer/calib 是一台画面 1284×2778 的 iPhone 上的实测值，换机后用 pointer-sample 和 calib 重新生成。",
+ "port": null,
+ "link": "serial",
+ "capture": "remote",
+ "brain_scale": 0.5,
+ "pointer": {
+  "name": "iphone-red-ring",
+  "h_ranges": [
+   [
+    0,
+    11
+   ],
+   [
+    171,
+    179
+   ]
+  ],
+  "s_min": 225,
+  "v_min": 139,
+  "min_area": 1813,
+  "max_area": 15115,
+  "fill_lo": 0.6,
+  "fill_hi": 0.9,
+  "min_aspect": 0.45,
+  "open_ksize": 3,
+  "fill_holes": true
+ },
+ "loc": {
+  "tol": 8,
+  "max_iter": 16,
+  "settle": 0.15,
+  "max_counts": 500,
+  "gain0": 2.0,
+  "damping": 0.85,
+  "adapt": 0.5,
+  "park_counts": 1500,
+  "corner_px": 70,
+  "nudge_counts": 60,
+  "roi_margin": 300,
+  "min_counts": 1,
+  "probe_counts": 100,
+  "edge_margin": 6,
+  "per_report_s": 0.01,
+  "stable_tol": 2.0,
+  "stable_timeout": 2.5,
+  "stable_gap": 0.08
+ },
+ "calib": {
+  "gains": {
+   "2": 0.5371944787874128,
+   "4": 1.768004795766494,
+   "12": 2.588542324460434,
+   "32": 4.720960116112861,
+   "64": 5.125301428838424,
+   "127": 3.567437397530111
+  },
+  "scale_x": 1.0,
+  "scale_y": 1.0
+ },
+ "ble_token": null,
+ "link_transport": "ble",
+ "ble_name": "HIL-Bridge",
+ "idle_quit_min": 10
+}

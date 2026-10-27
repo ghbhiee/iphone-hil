@@ -1,0 +1,15 @@
+# Python 3.12（macOS 13+）。建议：uv venv .venv && uv pip install -r requirements.txt
+numpy>=2.0
+opencv-python-headless>=4.9
+pillow>=10
+pyserial>=3.5
+pyobjc-core>=10
+pyobjc-framework-Cocoa>=10
+pyobjc-framework-AVFoundation>=10
+pyobjc-framework-CoreMedia>=10
+pyobjc-framework-CoreMediaIO>=10
+pyobjc-framework-CoreBluetooth>=10
+pyobjc-framework-IOBluetooth>=10
+pyobjc-framework-libdispatch>=10
+pyobjc-framework-Quartz>=10
+pytest>=8
