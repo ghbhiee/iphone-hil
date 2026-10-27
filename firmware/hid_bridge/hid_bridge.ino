@@ -38,7 +38,7 @@
 #define BACKEND_NAME "usb"
 #endif
 
-#define FW_VERSION "0.3.1"
+#define FW_VERSION "0.3.2"
 #define DEFAULT_NAME "HIL-Bridge"
 #define BAUD 115200
 
@@ -105,6 +105,7 @@ static bool g_hidAwake = true;
 static uint32_t g_lastActMs = 0;        // 最近一次活动（需要 HID 的命令 / WAKE）
 static volatile bool g_evt_adv = false; // 连接数变了 / 状态变了：loop() 里重新决定广播（回调里不碰广播，避免两个任务抢）
 static volatile bool g_evt_idle = false, g_evt_wake = false;
+static volatile bool g_evt_dropHid = false;   // 空闲(parked)时 iPhone 又连上来 → loop() 里把它断开，键盘才一直在
 struct LogMsg { char s[96]; };
 static QueueHandle_t g_logQueue = nullptr;   // 回调任务里产生的日志行，loop() 里打到串口（诊断用）
 static void qlog(const char* fmt, ...) {
@@ -157,6 +158,7 @@ static NimBLECharacteristic *g_inKbd = nullptr, *g_inMouse = nullptr, *g_inConsu
 static NimBLECharacteristic *g_nusRx = nullptr, *g_nusTx = nullptr;
 static uint16_t g_hidConn = BLE_HS_CONN_HANDLE_NONE;   // 订阅了鼠标输入报告的连接 = iPhone
 static uint16_t g_cmdConn = BLE_HS_CONN_HANDLE_NONE;   // 已通过 AUTH 的指令连接 = Mac
+static uint16_t g_dropHidConn = BLE_HS_CONN_HANDLE_NONE;   // 待 loop 断开的 iPhone HID 连接句柄
 struct BleMsg { uint16_t conn; char line[300]; };
 static QueueHandle_t g_bleQueue = nullptr;               // BLE 收到的整行命令，交给 loop() 执行（回调里不能 delay）
 static char g_bleBuf[300]; static size_t g_bleLen = 0;
@@ -173,18 +175,17 @@ static void updateAdvertising() {
   adv->stop();
   int n = g_server->getConnectedCount();
   bool ok = false;
-  if (n >= 2) { g_advMode = "off"; }                              // iPhone + Mac 都在，满了
-  else if (!g_hidAwake && !hidAlwaysOn()) { g_advMode = "off"; }  // 空闲中：不广播，iPhone 就不会连回来把键盘藏掉
-  else { ok = adv->start(); g_advMode = "pub"; }
+  if (n >= 2) { g_advMode = "off"; }       // iPhone + Mac 都在，满了
+  else { ok = adv->start(); g_advMode = "pub"; }   // 其余情况一直广播：板子始终可被 Mac/用户连上，绝不把自己变成不可达
   CMD_SERIAL.printf("# adv %s ok=%d conns=%d\n", g_advMode, ok ? 1 : 0, n);
 }
-static void hidGoIdle() {
+static void hidGoIdle() {   // 空闲：断开 iPhone 的 HID（键盘恢复），但板子继续广播、保留绑定
   if (!g_hidAwake) return;
   g_hidAwake = false; g_evt_idle = true;
-  if (g_hidConn != BLE_HS_CONN_HANDLE_NONE) g_server->disconnect(g_hidConn);   // 保留绑定，只断连接；onDisconnect 会清状态
+  if (g_hidConn != BLE_HS_CONN_HANDLE_NONE) g_server->disconnect(g_hidConn);   // 只断这条连接；onDisconnect 会清状态
   g_evt_adv = true;
 }
-static void hidWake() {   // 恢复广播 + 重置计时；iPhone 通常 1~3 s 自动连回来，没连就让用户到设置→蓝牙点一下
+static void hidWake() {   // 取消空闲、重置计时：下次 iPhone 连上来就接受（parked 时会被 loop 踢掉，这里解除）
   g_lastActMs = millis();
   if (g_hidAwake) return;
   g_hidAwake = true; g_evt_wake = true; g_evt_adv = true;
@@ -199,7 +200,8 @@ class MouseReportCB : public NimBLECharacteristicCallbacks {
       if (cfg.hidpeer[0] == 0) { strncpy(cfg.hidpeer, addr.c_str(), sizeof(cfg.hidpeer) - 1); saveConfig(); }  // 第一次：记住它
       if (strcasecmp(addr.c_str(), cfg.hidpeer) != 0) return;  // 不是记住的那台（比如 Mac 自己来配对）：不当 HID 目标
       g_hidConn = ci.getConnHandle(); g_ready = true; g_evt_conn = true;
-      g_hidAwake = true; g_lastActMs = millis();   // 用户手工点连也算醒来，hididle 从现在起算
+      // parked（空闲中）时 iPhone 自己连回来：不接受，交给 loop() 断开——不然键盘又被藏。要用它得先 WAKE/发命令。
+      if (!g_hidAwake && !hidAlwaysOn()) { g_dropHidConn = ci.getConnHandle(); g_evt_dropHid = true; }
     } else if (ci.getConnHandle() == g_hidConn) { g_hidConn = BLE_HS_CONN_HANDLE_NONE; g_ready = false; }
   }
 };
@@ -664,8 +666,9 @@ void loop() {
   while (g_logQueue && xQueueReceive(g_logQueue, &lm, 0) == pdTRUE) CMD_SERIAL.println(lm.s);
   BleMsg m;
   while (g_bleQueue && xQueueReceive(g_bleQueue, &m, 0) == pdTRUE) handleBleLine(m.conn, m.line);
-  // 空闲计时：醒着且超过 hididle 秒没活动 → 断开 iPhone、停止向它广播
+  // 空闲计时：醒着且超过 hididle 秒没活动 → 断开 iPhone（键盘恢复），板子继续广播
   if (!hidAlwaysOn() && g_hidAwake && (uint32_t)(millis() - g_lastActMs) > (uint32_t)cfg.hididle * 1000UL) hidGoIdle();
+  if (g_evt_dropHid) { g_evt_dropHid = false; if (g_dropHidConn != BLE_HS_CONN_HANDLE_NONE) { g_server->disconnect(g_dropHidConn); g_dropHidConn = BLE_HS_CONN_HANDLE_NONE; } }
   if (g_evt_adv) { g_evt_adv = false; updateAdvertising(); }
 #endif
   while (CMD_SERIAL.available()) {

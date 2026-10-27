@@ -221,13 +221,21 @@ it, and capture and Bluetooth are each ready in about 2 s. The capture service c
 commands; polling status does not keep them alive. They are tiny (about 30 MB RAM combined, near-zero CPU); the auto-quit mainly saves
 the iPhone's battery, because while capture runs the phone is continuously mirroring its display.
 
-The board idles too (firmware 0.3.0+): **after 120 s without an input command it lets go of the iPhone and stops advertising**.
-iOS hides the on-screen keyboard in every app while any Bluetooth keyboard is connected, so a board that stays connected around the
-clock leaves the user unable to type on their own phone. The next command wakes the board, it advertises again and the iPhone normally
-reconnects within 1–3 s; if it does not, `hil up` and the commands tell you to tap HIL-Bridge in the iPhone's Settings → Bluetooth (the bond
-is kept, it connects immediately) instead of retrying. Once the Mac daemon has exited the board is silent, so a freshly started daemon that
-cannot find it asks you to power-cycle the board. Change the limit over serial with `CFG hididle <seconds>` (0 = always connected, the old
-behaviour); see `firmware/FLASH.md`.
+The board idles too (firmware 0.3.2+): **after 120 s without an input command it drops the iPhone's HID connection so the phone's
+keyboard works again**. iOS hides the on-screen keyboard in every app while any Bluetooth keyboard is connected, so a board that stays
+connected around the clock leaves the user unable to type on their own phone.
+
+**Connecting is "software opens listening, you tap by hand" (important).** On iOS the iPhone (central) decides what to connect to; the
+board (peripheral) cannot force it, and once the board drops the iPhone, iOS enters a reconnection back-off and **no amount of advertising
+brings it back from software** (see `docs/IOS_RECONNECT_HANDOFF.md` for the measurements and the underlying constraint). The only reliable
+way is for the board to **advertise as a Bluetooth keyboard** (firmware `appearance=0x3C2`, versus the `appearance=0` it uses normally to
+keep macOS from claiming it) so the iPhone sees it in Settings → Bluetooth and **you tap HIL-Bridge by hand** to connect.
+
+So the workflow is: normally the board is in normal mode (`appearance=0`, drops the iPhone on idle to free the keyboard) → to use the tool,
+`hil up` (when the iPhone is not connected) or `hil listen` switches it to listening mode and prompts, and you tap HIL-Bridge → once
+connected, listening mode does not drop it mid-session → when done, `hil normal` / `hil stop` (or the services quitting after 10 idle
+minutes) switches back to normal mode, releases the iPhone, and the on-screen keyboard returns. Change the idle limit over serial with
+`CFG hididle <seconds>`; see `firmware/FLASH.md`.
 
 ---
 

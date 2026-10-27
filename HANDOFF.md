@@ -1,5 +1,9 @@
 # HANDOFF — iphone-hil（开发日志，2026-10-26 起）
 
+## 最新（2026-10-27 晚）：连接/放键盘的最终方案 = 「软件开侦听 + 用户手工点」，本文下面关于「WAKE 后 iPhone 1~3s 自动连回来」的说法已作废
+真机验证结论：**板子被 parked 踢开后，iOS 不会因 `WAKE` 自动重连**（BLE 外设不能强迫 iPhone 来连；板子主动断过后 iOS 进重连退避，怎么广播都勾不回来，实测 WAKE 后 90s 不回连、正常模式手工点也连不上）。可靠连接只有一条路：板子**以蓝牙键盘身份广播**（`CFG appearance 0x3C2`，平时用 `appearance=0` 防 macOS 抢），iPhone 才在设置→蓝牙可见，由用户**手工点 HIL-Bridge**。
+已纯工具层实现并真机端到端验证（没改固件）：`hil up`（iPhone 没连时）/ `hil listen` 经串口切侦听模式并提示用户手工点；`hil normal`/`hil stop`/空闲退出切回正常模式(`appearance=0`)+SLEEP，松开 iPhone、屏幕键盘恢复。连上后侦听模式 hidAlwaysOn 永不中途踢。改的文件：`hil/link.py`(`set_adv_mode`/`listen_and_wait`)、`hil/cli.py`(`listen`/`normal` + 改写 up/stop)、`hil/link_server.py`(退出切正常、去掉 open 时的 WAKE)。另：之前 iPhone 连不上还因为反复刷固件把 NVS 配对区搞坏（`unbond all` 永远 removed=1 left=1），已 `esptool erase-region 0x9000 0x5000` 擦 NVS、写回 token、干净重配修复。全量交接见 `docs/IOS_RECONNECT_HANDOFF.md`。
+
 ## 一句话
 Mac 取帧 + Mac↔ESP32 协议/串口 + ESP32-S3 HID 固件 + 反馈式定位闭环，四部分都搭好、**全部用桩/仿真跑通**；
 真机部分（iPhone 画面、ESP32 板子、iOS 蓝牙配对）等硬件到了做联调。
@@ -79,72 +83,30 @@ Mac 取帧 + Mac↔ESP32 协议/串口 + ESP32-S3 HID 固件 + 反馈式定位�
 - `docs/PROTOCOL.md` 按固件 0.2.3 重新生成（AUTH、ST 字段、CFG 子命令）；`firmware/FLASH.md` 改为以经典 ESP32 为主，`firmware/prebuilt/esp32/` 放经真机验证的二进制（刷写偏移 0x1000/0x8000/0xe000/0x10000，来自 arduino 的 flash_args）。
 - README 重写：背景（中文互联网只剩 App 入口、浏览器/镜像/cookie 各条路为什么不通）、两条官方通道（USB 采集、辅助触控指针设备）、闭环定位、安装、skill、安全边界。
 
-## 2026-10-27 下午 板子空闲时断开 iPhone（固件 0.3.1）✅（定案：空闲→停广播；再用自动重连，连不上才手工点）
-- **问题**：用户在手机网页聊天里键盘弹不出来。原因不是网页：板子作为蓝牙鼠标+键盘绑定在 iPhone 上，只要通电 iPhone 就自动重连，
-  iOS 一检测到硬件键盘就把所有 App 的屏幕键盘藏掉。临时解法：关板子电 / 辅助功能→触控→辅助触控→「显示屏幕键盘」。
-- **定案（用户拍板）**：固件空闲超时断开 iPhone 并停止广播；下次命令自动叫醒、iPhone 自己连回来（1~3 s），连不上才提示用户去设置→蓝牙点一下。
-- **固件 0.3.1（定稿）**：
-  - `CFG hididle <秒>`（默认 120，存 NVS；0 = 一直连着）。自上次「活动」（需要 HID 的命令 MV/BT/CK/LP/WH/KP/KD/KU/TX/CC，或 `WAKE`）超过这个时间
-    → `g_server->disconnect(iPhone)`（**不清绑定**）→ **停止广播，直到被叫醒**。PING/ST/CFG/RL 不算活动。
-  - 叫醒：`WAKE` 或任何需要 HID 的命令（来自串口，或已连着的 Mac 指令通道）→ 恢复公开地址广播 → iPhone 按绑定自动连回来（真板实测 1~3 s）。
-  - 新命令 `WAKE`、`SLEEP`（立刻断开+停广播）、`RESTART`（硬复位）。`ST` 多了 `hid=on|waking|idle hididle= idle= conns= adv=pub|off`；
-    串口多了事件行 `# conn/# disc/# auth/# sub/# params/# adv/# hid idle/# hid wake`（诊断用）。广播启停全在 loop() 里（回调只置 `g_evt_adv`），`advertiseOnDisconnect(false)`。
-  - 上电正常广播（上次断电/链路丢失的话 iPhone 会自动连上，2 分钟没命令再断开）。appearance≠0（配对模式）或 hididle=0 时一直醒着。
-  - `replyf` 缓冲 200→300：ST 一行约 183 字节，之前 200 的缓冲会截断尾部字段（`hil up` 偶尔显示「固件 None」就是这个，现已不复现）。
-  - **修正了之前对 iOS 的误判**：BLE ST 分支和 `handleBleLine` 之前没加 `#if HID_BACKEND==1`，usb 变体编译坏了（0.2.1 遗留）；这次补上 `#if` 后 **usb 变体恢复编译**。
-- **关键认知修正（推翻了早先「iOS ≥60 s 不再自动重连」的结论）**：早先那些「断开 60 s 后再广播 iPhone 永不回连」的失败样本，共同点是**空闲期间板子在用静态随机地址广播**
-  （同名 HIL-Bridge、同 NUS UUID）——Mac 的 CoreBluetooth 当时也从没扫到过那个随机地址。真正的原因更可能是**随机地址广播把 iOS 的重连逻辑搞坏了**，
-  而不是「配件主动断开后 iOS 放弃」。最后一轮验证（14:29）：`SLEEP`（LL 断开 0x13）→ 完全不广播 90 s → 恢复公开地址广播 → iPhone 1 s 内自动连回来。
-  所以 0.3.1 的做法是**空闲后一直不广播、直到被叫醒**（不再「静默 90 s 再自动恢复」，那样 iPhone 90 s 后又连回来、键盘又没了）。
-  代价：空闲时板子对外没有广播，**守护进程退出后新起的守护进程连不上板子**（已连着的不受影响）——`hil up`/CLI 在连不上时提示用户给板子断电重启。
-- **Mac 端**（`hil/link_server.py`）：链路一打开就发 `WAKE`；`/cmd` 收到 `ERR not connected` 且命令需要 HID → `WAKE` + 轮询 `ST` 到 `conn=1`
-  （上限 `hil.json` `hid_wake_timeout_s`，默认 20）→ 重发一次；超时回 503：「请到 iPhone 设置→蓝牙 点一下 HIL-Bridge」。
-  新接口 `/wake?timeout=` `/sleep`；退出（`/quit` 或空闲自动退出）前发 `SLEEP`，屏幕键盘立刻恢复。`hil up` 在未连时打同样的提示，连不上板子时提示断电重启。
-  skill 两份都写了：报未连→转告用户去点；报连不上板子→让用户断电重启；连不上之前别发命令、别自己想别的办法。
-- **顺带发现**（14:02）：Mac 守护进程连上 1 s 后板子出现 `# auth h=1 enc=0 bonded=0`——Mac 那条连接上跑了一次 SMP 配对、31 s 后超时失败，
-  期间 Mac 发的命令全部 5 s 超时，之后正常。偶发、自愈，先记着。
-- **build.sh 修复**：`set -e` 下 `curl /quit` 在守护进程没跑时返回非零，刷写被静默跳过；已加 `|| true`。
-- **刷机**：`firmware/build.sh esp32 --upload /dev/cu.usbserial-110` 只刷 0x10000（绑定保留，实测刷完不用重新配对）。`firmware/prebuilt/esp32/` 已更新为 0.3.1。
-- **配对注意**：给新 iPhone 配对前先 `CFG appearance 0x3C2` 重启（配对模式不睡），配完 `CFG appearance 0` 重启。换 iPhone 仍是 `CFG hidpeer clear`。
-- **真板验证（0.3.1，下午晚些）**：空闲 >120 s → `conn=0 hid=idle adv=off`（iPhone 断开、键盘恢复）✅；`WAKE` → iPhone 2.8 s 自动连回来 `hid=on` ✅；
-  空闲中发 MV → 守护进程自动 `WAKE`+等 1.0 s+重发，`OK mv` ✅；`SLEEP` → 立刻 `conn=0 adv=off` ✅；17 个 pytest 全过；usb 变体编译通过。
-- **残留**：NVS 里有个旧键 `sleepmode=1`（当前固件不读，无害）；BLE ST 偶发缺 fw 字段的根因没深究（现不复现）。
+## 2026-10-27 傍晚 空闲放开 iPhone 的最终设计（固件 0.3.2）✅ 固件/BLE 级已验，键盘可视化待手机解锁
 
-## 未验证 / 待做 ⏳
-1. ~~标点/空格输入~~ 已验证。~~粘贴~~ 2026-10-27 接力打开后验证：本地 ⌘a/⌘x/⌘v 都好使，ASCII 和中文（「你好世界」）经通用剪贴板粘进 Spotlight 都成功（见末节）。
-2. 长按、拖动（滑动翻页）、滚轮在真机上的效果；`tap` 命令行形式（`python -m hil tap X Y`）端到端。
-3. 自动隐藏指针建议关掉（现在开着，靠微动找回）。
-4. 测试机 iPhone 上还开着「增强对比度」，指针外观可能变化，识别阈值若失效用 `pointer-sample` 重采。
-
-## 旧的未验证清单（已过时）
-1. ~~iPhone 插 USB 后取帧~~ 已验证（见上）。锁屏时不出帧（设备消失），解锁自动恢复。
-2. ~~ESP32 真板串口、PING~~ 已验证。待验：BLE 在 iPhone 上配对（Just Works）、指针是否出现（需 AssistiveTouch 开）、键盘/Consumer HOME 是否生效、连接间隔是否被接受。
-3. 指针识别阈值：真机指针颜色/大小（`python -m hil pointer-sample 帧.png x y` 从截图采样写入 `hil.json`）。
-4. 标定：`python -m hil calib`，看增益表合不合理；`hil.json` 里 `loc.settle`（发完 MV 等画面刷新的秒数）真机估计 0.08–0.15。
-5. ~~通用剪贴板 `paste` 的同步延迟~~ 实测等 2 s 常落空、4~5 s 稳，默认改 5 s（根因：iPhone 收到 ⌘V 才去拉，且要先收到 Mac 的广播；见末节）。
-
-## 真机联调步骤（按顺序）
-1. iPhone 接 Mac → `python -m hil status` 看 device 变成 iPhone → `python -m hil grab` 看图清不清楚。
-2. 刷固件（`firmware/FLASH.md` 方法 A）→ `python -m hil send PING`。
-3. iPhone 设置：AssistiveTouch、配对 HIL-Bridge、指针颜色/大小、关自动隐藏和指针动画（FLASH.md 末节）。
-4. `python -m hil send "MV 50 50"` 看指针动；`grab` 后 `pointer-sample` 采样指针颜色；`find --debug` 确认只识别出指针。
-5. `park` → `calib` → `tap X Y` 试点一个按钮；按需调 `hil.json` 的 `loc.settle` / `tol` / `max_counts`。
-6. `type` / `paste` / `key GUI+H` / `cc HOME` 各试一次。
-
-## 关键决定与坑
-- **HID 走 BLE 而不是 USB**：iPhone 只有一个口，被 Mac 录屏占了；USB HID 版固件留着（改用 AirPlay 取画面时可用）。
-- **取帧必须独立进程**：Claude Code 的宿主 `com.anthropic.claude-code` 是 hardened runtime 且无 `com.apple.security.device.camera` entitlement，子进程申请相机权限被 TCC 直接拒绝（不弹框、状态停在 notDetermined）。iPhone 屏幕采集设备和摄像头同一道权限。所以做了 `HIL Capture.app`（`tools/make_app.sh`），`open -g` 启动后父进程是 launchd。
-- **分辨率**：macOS 下 session 在 `startRunning` 前会把设备 `activeFormat` 改回配合 preset 的（High=1080p），`InputPriority` preset 在 macOS 上 `canSetSessionPreset` 返回 NO。解法同 ffmpeg：`lockForConfiguration` 后设 activeFormat **不解锁**，`startRunning` 之后再解锁。
-- **pyobjc 回调里的 CMSampleBuffer 是裸指针**（PyObjCPointer），没桥接成 CF 对象；帧处理全程用 ctypes（CMSampleBufferGetImageBuffer / CVPixelBufferRetain / Lock / GetBaseAddress / Release）。
-- **`/quit` 必须真退出进程**，否则 `open` 第二次会超时（-1712）且旧代码一直在跑。
-- **arduino-cli 的 ctags 是 x86_64**，本机没 Rosetta；`firmware/build.sh` 用 `runtime.tools.ctags.path` 指到空壳 stub。固件源码保持"先定义后使用"。装 Rosetta 后 stub 自动不用。
-- 指针识别别用"填充率×长宽比"当圆度：ROI 把矩形截成正方形时会误判。现在用填充率 ∈ [0.6, 0.9]（圆 0.785）+ 周长圆度，并且最小面积要按真实指针定。
-- 定位：没标定时前两步最多 100 counts 先学增益；指针贴屏幕边缘时不学增益；连续 2 次发了 ≥3 counts 不动 → 复位。
-
-## 用户侧待办
-- iPhone 接 Mac 试取帧（随时可做）。
-- ESP32-S3 板子到了刷固件；iOS 侧设置见 `firmware/FLASH.md`。
-- 可选：装 Rosetta（Arduino IDE 在 Apple Silicon 也需要它）。
+- **用户反馈（0.3.1 不行）**：在叮咚买菜那个 session 实测，ESP32「自己会挂掉、无法唤醒、手机连不上」。根因就是 0.3.1 的设计缺陷：
+  空闲后**停止广播**——守护进程退出（空闲 10 min 自动退）后板子对外不可达，新守护进程连不上、iPhone 也看不到，只能断电重启。
+  用户明确：超时断开只是「把不用的蓝牙连接断掉让键盘恢复」，**不是让板子把自己杀死**。
+- **0.3.2 设计**：空闲 hididle 秒 → 断开 iPhone 的 HID（键盘恢复），**板子始终继续广播、始终可被 Mac/用户连上**。
+  这个状态叫 parked。parked 期间 iPhone 若自己连回来（onSubscribe），loop() 里把它再断开（`g_evt_dropHid`/`g_dropHidConn`），键盘才一直在。
+  要操作手机：`WAKE`/HID 命令退出 parked，之后接受 iPhone 连接；iPhone 解锁时 1~3 s 自动连回来，没连就提示用户去设置→蓝牙点一下。
+  `updateAdvertising` 只在「两个连接都占满」时 off，其余一律 pub。版本 0.3.2。
+- **已验证（固件/BLE 级，不需要手机解锁）**：
+  - `SLEEP`（parked）后 `ST` 仍 `adv=pub`（0.3.1 是 `adv=off`）——板子没把自己变不可达 ✅。
+  - 守护进程 `/quit` 后重启，新守护进程照样连上 parked 的板子（拿到完整 ST，fw=0.3.2）✅——不再「挂掉」。
+  - esp32 + usb 两个变体都编译通过；17 个 pytest 全过；`firmware/prebuilt/esp32/` 已更新为 0.3.2，板子已刷。
+- **待验证（需要 iPhone 解锁 + 自动锁定设「永不」）**：parked 时键盘是否真的一直在（iPhone 自动回连被板子踢掉，会不会反复重连导致键盘闪烁）；
+  `WAKE` 后 iPhone 是否 1~3 s 连回来。这次本想验，但手机自动锁屏了（取帧拿不到帧、iOS 锁屏也不自动重连 HID），只能等解锁再看。
+  注意：iPhone 锁屏时 iOS 不会自动重连蓝牙 HID——所以「WAKE 后没连上」最常见的原因就是手机锁着。
+- **纠正 0.3.1 HANDOFF 的误判**：早先「iOS ≥60 s 后永不自动重连」是错的（那些失败样本都是空闲时用随机地址广播搞坏了 iOS 重连）。
+  0.3.2 用公开地址一直广播，解锁状态下 iPhone 正常自动回连（本会话早些时候实测 2.8 s）。
+- **Mac 端 / CLI / skill**：守护进程启动发 WAKE、`ERR not connected` 时 WAKE+轮询+重发（`hid_wake_timeout_s`）；
+  `hil up` 和命令未连时提示「解锁 iPhone 并到设置→蓝牙点一下」，连不上板子才提示查供电/断电重启（现在很少见，因为板子一直广播）。
+  两份 skill 都加了**开工前必须确认 iPhone HID 已连、没连就原话提示用户手动去设置→蓝牙点一下**的硬步骤。
+- **顺带修复**：BLE ST 分支和 `handleBleLine` 补了 `#if HID_BACKEND==1`，usb 变体（0.2.1 起坏的）恢复编译。
+- **build.sh**：`curl /quit || true`（守护进程没跑时别被 set -e 跳过刷写）。配对新 iPhone 仍：`CFG appearance 0x3C2` 重启→配对→`CFG appearance 0` 重启。
+- **残留**：NVS 旧键 `sleepmode=1`（当前固件不读，无害）；`hil up` 偶发「固件 None」（刚连上那一下 ST 还没拿全，不复现、不影响功能）。
 
 ## 2026-10-27 下午 通用剪贴板粘贴实测（接力已开）
 

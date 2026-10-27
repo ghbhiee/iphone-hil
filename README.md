@@ -171,7 +171,11 @@ tests/                 协议 / 固件模型 / 定位闭环（仿真）
 
 两个 `.app` 都是**按需拉起、空闲 10 分钟自动退出**的常驻服务：任何一条 `hil` 命令发现服务没起就会 `open -g` 它，取帧和蓝牙各约 2 秒就绪。取帧服务只把「取帧」算作活动，链路服务只把「发命令」算作活动，单纯查状态不续命。资源本身很小（合计约 30 MB 内存、CPU 接近 0），自动退出主要是省 iPhone 的电——采集在跑时手机一直在做镜像输出。
 
-板子侧也有空闲（固件 0.3.0 起）：**120 秒没收到操作命令就放开 iPhone 并停止广播**。原因是 iOS 只要连着一个蓝牙键盘就把所有 App 的屏幕键盘藏起来——板子常年挂在手机上，用户自己就再也弹不出键盘。下一条命令会叫醒板子重新广播，iPhone 通常 1~3 秒自动连回来；没连回来时 `hil up` 和各条命令会直接提示你到 iPhone 设置→蓝牙里点一下 HIL-Bridge（绑定还在，点完立刻连上），不会反复重试。守护进程退出后板子没有广播，新起的守护进程连不上时提示给板子断电重启。时限用串口 `CFG hididle <秒>` 改，0 为一直连着（见 `firmware/FLASH.md`）。
+板子侧也有空闲（固件 0.3.2 起）：**120 秒没收到操作命令就断开 iPhone 的 HID 连接，让手机键盘恢复**。原因是 iOS 只要连着一个蓝牙键盘就把所有 App 的屏幕键盘藏起来——板子常年挂在手机上，用户自己就再也弹不出键盘。
+
+**连接是「软件开侦听 + 用户手工点」（重要）**：iOS 的蓝牙 HID 由 iPhone（central）决定连谁，板子（peripheral）无法强迫它来连；板子一旦主动断开 iPhone，iOS 就进重连退避，**软件无论怎么广播都叫不回来**（`docs/IOS_RECONNECT_HANDOFF.md` 有实测与底层约束）。可靠的办法只有一个：板子**以蓝牙键盘身份广播**（固件 `appearance=0x3C2`，和平时防 macOS 抢用的 `appearance=0` 相对），iPhone 才在设置→蓝牙里可见可连，由**用户手工点一下 HIL-Bridge**连上。
+
+于是工作流是：平时板子正常模式（`appearance=0`，空闲踢 iPhone 放键盘）→ 要用时 `hil up`（iPhone 没连会自动切侦听模式并提示）或 `hil listen` 切侦听、用户手工点连上 → 连上后侦听模式不会再中途踢它 → 用完 `hil normal` / `hil stop`（或空闲 10 分钟服务退出）切回正常模式、松开 iPhone、屏幕键盘恢复。时限用串口 `CFG hididle <秒>` 改（见 `firmware/FLASH.md`）。
 
 ---
 
@@ -278,7 +282,9 @@ python -m hil type "ascii"         # ASCII 文本（先确认 iPhone 在英文�
 python -m hil key GUI+H            # 组合键；GUI+SPACE 打开 Spotlight
 python -m hil home                 # 回主屏
 python -m hil goto X Y             # 只把指针挪过去不点（滚轮要落在列表上时用）
-python -m hil status / up / stop   # 两个服务 + 固件状态 / 拉起 / 立刻停
+python -m hil listen               # 把板子切侦听模式（以键盘身份广播），提示用户去设置→蓝牙手工点 HIL-Bridge
+python -m hil normal               # 切回正常模式：松开 iPhone、屏幕键盘恢复（用完收尾用）
+python -m hil status / up / stop   # 两个服务 + 固件状态 / 拉起(iPhone 没连会自动开侦听) / 立刻停(并切回正常模式)
 python -m hil run script.txt       # 一行一个动作，走 Runner（每步存帧 + log.jsonl）
 python -m hil step                 # 交互式：人来当大脑
 ```

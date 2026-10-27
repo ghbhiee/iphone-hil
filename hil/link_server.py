@@ -10,13 +10,12 @@
   GET /sleep                   → 让板子立刻放开 iPhone（屏幕键盘马上恢复）
   GET /quit
 
-板子的 HID 空闲（固件 ≥0.3.0）：板子 hididle 秒（默认 120）没收到需要 HID 的命令就主动断开 iPhone 并停止广播，
-iPhone 的屏幕键盘才会恢复（iOS 连着蓝牙键盘时藏掉所有 App 的屏幕键盘）。所以这里：
-  - 链路一打开就发 WAKE，板子恢复广播，iPhone 通常 1~3 s 连回来；
-  - /cmd 收到 "ERR not connected" 且命令需要 HID 时，等 iPhone 连回来（最多 hid_wake_timeout_s）再重发一次，
-    等不到就回「请到 iPhone 设置→蓝牙 点一下 HIL-Bridge」；
-  - 退出前发 SLEEP（板子立刻放开 iPhone、停止广播）。之后板子只能被串口或下一次上电叫醒：
-    新起的守护进程连不上时，提示用户给板子断电重启。
+板子的 HID 空闲（固件 ≥0.3.2）：板子 hididle 秒（默认 120）没收到需要 HID 的命令就断开 iPhone 的 HID（键盘恢复），
+但**板子始终继续广播、不失联**（iOS 连着蓝牙键盘时藏掉所有 App 的屏幕键盘，所以只断这条不用的连接）。所以这里：
+  - 链路一打开就发 WAKE 让板子退出空闲；iPhone 解锁时 1~3 s 自动连回来；
+  - /cmd 收到 "ERR not connected" 且命令需要 HID 时，WAKE+等 iPhone 连回来（最多 hid_wake_timeout_s）再重发一次，
+    等不到就回「请解锁 iPhone 并到 设置→蓝牙 点一下 HIL-Bridge」（多半是 iPhone 锁屏，iOS 锁屏不自动重连 HID）；
+  - 退出前发 SLEEP（板子立刻松开 iPhone、键盘恢复，但仍在广播）。板子一直可被新守护进程连上，不用断电重启。
 """
 from __future__ import annotations
 
@@ -100,15 +99,12 @@ def _open_link_locked():
                 S.link = SerialLink(port=S.port)
             S.err = None
             print(f"[link] 已打开 {S.link.port}", flush=True)
-            try:   # 守护进程起来 = 马上要用：先让板子叫 iPhone 连回来，第一条命令就不用等
-                r = S.link.send("WAKE")
-                print(f"[link] WAKE → {r.raw}", flush=True)
-            except Exception as e:  # noqa
-                print(f"[link] WAKE 失败: {e}", flush=True)
+            # 不再在打开时发 WAKE：iOS 不会因 WAKE 自动重连；而且板子处于正常(parked)时 WAKE 会把它叫醒、
+            # iPhone 连回来又藏屏幕键盘。连接统一走「hil up/listen 切侦听模式 + 用户手工点」。
         except Exception as e:  # noqa
             S.err = f"{type(e).__name__}: {e}"
-            if S.transport == "ble" and "没连上" in str(e):   # 固件 ≥0.3.1：板子空闲时不广播，只有连着的 Mac 或串口能叫醒它
-                S.err += "。板子可能在空闲中（空闲后不广播）：给板子断电重启或按一下 EN 键，再跑一次命令"
+            if S.transport == "ble" and "没连上" in str(e):   # 固件 ≥0.3.2 板子始终广播，连不上基本只有板子断电/死机
+                S.err += "。板子一直在广播，连不上基本是板子断电或死机了：检查 ESP32 供电，必要时断电重启"
             print(f"[link] 打开失败: {S.err}", flush=True)
 
 
@@ -202,7 +198,7 @@ class H(BaseHTTPRequestHandler):
                         else:
                             S.n_cmd += 1
                             return self._json(503, {"ok": False, "hid_wait_s": round(waited, 1),
-                                                    "text": "iPhone 的 HID 没连上：请到 iPhone 设置→蓝牙 点一下 HIL-Bridge（板子空闲时放开了它，这次没有自动连回来）"})
+                                                    "text": "iPhone 的 HID 没连上：请解锁 iPhone 并到 设置→蓝牙 点一下 HIL-Bridge（板子空闲时松开了手机，iPhone 锁屏时 iOS 不会自动重连）"})
                 S.n_cmd += 1
                 d = {"ok": r.ok, "text": r.text, "raw": r.raw}
                 if waited is not None:
@@ -250,14 +246,13 @@ def main(argv=None):
                 time.sleep(2)
     finally:
         if S.link:
-            if S.lock.acquire(timeout=3):   # 退出前让板子立刻放开 iPhone（屏幕键盘马上恢复），不用等板子自己的 hididle
-                try:
-                    S.link.send("SLEEP")
-                except Exception:
-                    pass
-                finally:
-                    S.lock.release()
-            S.link.close()
+            S.link.close(); S.link = None   # 先放掉 BLE，免得和串口切换抢板子
+        try:   # 退出前经串口把板子切回正常模式：重启→iPhone 断开、板子恢复空闲自动踢→屏幕键盘恢复
+            from hil.link import set_adv_mode
+            set_adv_mode(False, port=S.port)
+            print("[link] 已把板子切回正常模式（iPhone 松开，屏幕键盘恢复）", flush=True)
+        except Exception as e:  # noqa
+            print(f"[link] 退出时切回正常模式失败: {e}", flush=True)
         print("[link] bye", flush=True)
         os._exit(0)
 

@@ -98,23 +98,23 @@ screen /dev/cu.usbserial-XXXX 115200      # 退出：Ctrl-A 然后 K
 - 换 HID 目标：`CFG hidpeer clear`，再让新 iPhone 配对一次。
 - 删掉 Mac 误配对留下的绑定：`CFG unbond others`（保留 iPhone），`CFG unbond all`（全删）。
 
-## 空闲时放开 iPhone（固件 ≥0.3.0）
+## 空闲时放开 iPhone（固件 ≥0.3.2）
 
 iOS 只要连着一个蓝牙键盘，就把**所有 App 的屏幕键盘**藏起来。板子以前常年挂在 iPhone 上，用户在手机上就再也弹不出键盘。
-现在（0.3.1 定稿）：
+现在（0.3.2）——目标是**只断开不用的 HID 连接让键盘恢复，绝不把板子自己变成不可达**：
 
-- `hididle` 秒（默认 120）没有需要 HID 的命令（MV/CK/KP/TX/CC …）→ 断开 iPhone（**不清绑定**）→ **停止广播**，直到被叫醒。
-  `SLEEP` 立刻进入这个状态；`hil stop` 退出时会发。
-- 叫醒：`WAKE` 或任何需要 HID 的命令（来自串口，或已经连着的 Mac 指令通道）→ 恢复广播 → iPhone 按绑定自动连回来（实测 1~3 s）。
-  没连回来时，`hil up` 和各条命令会直接提示：到 iPhone 设置→蓝牙 点一下 HIL-Bridge（绑定还在，点完立刻连上）。
-- 空闲时板子对外没有广播，所以**守护进程退出后再新起一个会连不上**：给板子断电重启（或按 EN 键）就行，上电时正常广播，
-  iPhone 会自动连上，再过 2 分钟没命令又放开。守护进程本身空闲 10 分钟才退，日常用一般碰不到。
-- `ST` 里看：`hid=on`（iPhone 连着）/ `waking`（在广播）/ `idle`（已放开），`idle=` 距上次活动秒数，`conns=` 连接数，`adv=pub|off`。
-- 不想要这个行为：`CFG hididle 0`（一直连着，旧行为）；改时限：`CFG hididle 300`。配对模式（appearance≠0）下自动不睡。
-- 验证：`python -m hil stop` 后看 iPhone 设置→蓝牙，HIL-Bridge 应变成「未连接」，任意 App 的输入框能弹出屏幕键盘；
-  再用时 `python -m hil up`，看它报告「iPhone HID 已连」。
+- `hididle` 秒（默认 120）没有需要 HID 的命令（MV/CK/KP/TX/CC …）→ 断开 iPhone 的 HID（**不清绑定**），键盘恢复。
+  板子**继续广播**（始终可被 Mac/用户连上）。这个状态叫 parked。`SLEEP` 立刻进入；`hil stop` 退出时会发。
+- parked 期间 iPhone 若自己连回来，板子会再把它断开——否则 iOS 一重连键盘又被藏。所以 parked 时键盘一直在。
+- 要用板子操作手机：**实测被 parked 踢开后 iOS 不会因 `WAKE` 自动重连**（外设没法强迫 iPhone 来连）。可靠做法是工具层把板子切「侦听模式」（`CFG appearance 0x3C2` 重启，以蓝牙键盘身份广播），由**用户手工在设置→蓝牙点 HIL-Bridge**连上——`hil up`/`hil listen` 会自动做并提示。详见 `docs/IOS_RECONNECT_HANDOFF.md`。
+- **板子永远在广播，所以守护进程退出后新起一个也能连上**（不像旧版会变不可达）。只有板子断电/死机才连不上，那时才需要断电重启。
+- `ST` 里看：`hid=on`（iPhone 连着）/ `idle`（parked，已放开）/ `waking`（刚退出 parked 等 iPhone 连）；`idle=` 距上次活动秒数，`conns=` 连接数，`adv=pub|off`（off 只在两个连接占满时）。
+- 不想要这个行为：`CFG hididle 0`（一直连着，旧行为）；改时限：`CFG hididle 300`。配对模式（appearance≠0）下不进 parked。
+- 验证：`python -m hil normal`（切正常模式 + SLEEP）后，任意 App 输入框能弹出屏幕键盘，板子串口 `conn=0 hid=idle`、仍 `adv=pub`；
+  再 `python -m hil up`（会切侦听模式并提示）→ 用户在 iPhone 设置→蓝牙点 HIL-Bridge → 报「iPhone HID 已连」。
 - 串口 `RESTART` = 硬复位（等于断电重启，绑定/配置都在）。
-- 之前一版（未发布）在断开后静默 90 s 再恢复广播，结果 iPhone 在 90 s 后自己连回来、键盘又被藏，所以改成一直不广播直到被叫醒。
+- 历史：0.3.0/0.3.1 曾在空闲时**停止广播**（甚至静默 90 s），结果板子对外不可达——守护进程退出后再也连不上、只能断电重启，等于「自杀」。
+  0.3.2 改为「断 HID 但一直广播 + parked 时踢掉 iPhone 的回连」，既让键盘恢复又保证板子始终可达。
 
 ## 常用硬件键盘快捷键（iOS）
 

@@ -196,6 +196,70 @@ class SerialLink(Link):
 
 
 # ---------------------------------------------------------------------------
+# 广播模式切换（经串口，独立于 BLE 守护进程）
+# ---------------------------------------------------------------------------
+# 背景：固件默认 appearance=0 时只广播命令服务、不以蓝牙键盘身份广播（防 macOS 自动把板子
+# 当键鼠抢走）。这样 iPhone 在设置→蓝牙里看不到它，被板子踢掉后也连不回来。
+# appearance=0x3C2（侦听/配对模式）才广播 HID 身份，iPhone 才能在设置里手工点着连上。
+# appearance 改了要重启才生效（广播数据在 setup 里一次性设好）。改模式不碰 BLE 守护进程：
+# 守护进程按名字 HIL-Bridge 广扫、命令服务一直都在，重启后它会自己按名字重连。
+def set_adv_mode(listen: bool, port: Optional[str] = None, settle: float = 3.5,
+                 log: Optional[Callable[[str], None]] = None) -> dict:
+    """经串口把板子切到侦听模式(listen=True, 以蓝牙键盘身份广播, iPhone 可手工连)
+    或正常模式(False, 不广播 HID 身份, 空闲会自动踢 iPhone 让屏幕键盘恢复)，并重启生效。
+    返回重启后的 ST 字段。"""
+    sl = SerialLink(port=port, log=log)
+    try:
+        sl.send(f"CFG appearance {'0x3C2' if listen else '0'}")
+        sl.ser.write(b"RESTART\n"); sl.ser.flush()
+        time.sleep(settle)
+        sl.ser.reset_input_buffer()
+        last = None
+        st = None
+        for _ in range(6):   # 重启后等它起来
+            try:
+                st = sl.status(); break
+            except Exception as e:
+                last = e; time.sleep(0.8)
+        if st is None:
+            raise LinkError(f"切模式后板子没回应: {last}")
+        if not listen:   # 回正常模式：立刻 park 一下，iPhone 松开、屏幕键盘马上恢复（不用等 hididle）
+            try:
+                sl.send("SLEEP")
+            except Exception:
+                pass
+        return st
+    finally:
+        sl.close()
+
+
+def listen_and_wait(port: Optional[str] = None, wait_s: float = 60.0,
+                    prompt: Optional[Callable[[], None]] = None,
+                    log: Optional[Callable[[str], None]] = None) -> dict:
+    """把板子切到侦听模式，提示用户去 iPhone 设置→蓝牙手工点 HIL-Bridge，然后轮询直到 conn=1 或超时。
+    返回最后一次 ST（含 conn 字段）。全程走串口，不依赖 BLE 守护进程。"""
+    st = set_adv_mode(True, port=port, log=log)
+    if st.get("conn") == "1":
+        return st
+    if prompt:
+        prompt()
+    sl = SerialLink(port=port, log=log)
+    try:
+        t0 = time.time()
+        while time.time() - t0 < wait_s:
+            try:
+                st = sl.status()
+                if st.get("conn") == "1":
+                    return st
+            except Exception:
+                pass
+            time.sleep(2.0)
+        return st
+    finally:
+        sl.close()
+
+
+# ---------------------------------------------------------------------------
 # 固件参考模型 + 回环桩
 # ---------------------------------------------------------------------------
 class FirmwareModel:
