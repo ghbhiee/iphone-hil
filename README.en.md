@@ -221,6 +221,14 @@ it, and capture and Bluetooth are each ready in about 2 s. The capture service c
 commands; polling status does not keep them alive. They are tiny (about 30 MB RAM combined, near-zero CPU); the auto-quit mainly saves
 the iPhone's battery, because while capture runs the phone is continuously mirroring its display.
 
+The board idles too (firmware 0.3.0+): **after 120 s without an input command it lets go of the iPhone and stops advertising**.
+iOS hides the on-screen keyboard in every app while any Bluetooth keyboard is connected, so a board that stays connected around the
+clock leaves the user unable to type on their own phone. The next command wakes the board, it advertises again and the iPhone normally
+reconnects within 1–3 s; if it does not, `hil up` and the commands tell you to tap HIL-Bridge in the iPhone's Settings → Bluetooth (the bond
+is kept, it connects immediately) instead of retrying. Once the Mac daemon has exited the board is silent, so a freshly started daemon that
+cannot find it asks you to power-cycle the board. Change the limit over serial with `CFG hididle <seconds>` (0 = always connected, the old
+behaviour); see `firmware/FLASH.md`.
+
 ---
 
 ## 5. What it does and what it refuses to do
@@ -382,7 +390,7 @@ The services quit on their own after 10 idle minutes.
 
 ## 11. Known limitations and to-do
 
-- **No working path for Chinese text input yet.** A Bluetooth keyboard only sends ASCII; the plan is Mac clipboard → Universal Clipboard → `⌘+V` on the iPhone, which requires Handoff enabled on both devices and is not yet verified. In practice we navigate through lists, index bars and menus instead of typing; when a Chinese search is unavoidable, the user types it on the phone.
+- **Chinese input goes through Universal Clipboard: slow but workable.** A Bluetooth keyboard only sends ASCII; for anything else use `paste`: Mac `pbcopy` → Universal Clipboard → `⌘V` on the iPhone, with Handoff enabled on both devices. Measured behaviour: the iPhone only fetches the Mac's clipboard when it receives `⌘V`, and only if it has already seen the Mac's Bluetooth advertisement. Pasting 2 s after the copy often does nothing at all; 4–5 s is reliable; a copy on the Mac expires after 2 minutes. So `paste` always copies fresh, waits 5 s by default, and the caller must confirm with a screenshot, re-sending `⌘V` once after 3 s if nothing appeared. Prefer lists, index bars and menus over typing whenever possible.
 - **Negative wheel direction has no effect** (cannot scroll up; cause unknown). Use `drag` or arrow keys to go up.
 - The Chinese Pinyin keyboard swallows letters into pinyin composition and treats digits as candidate selectors; switch to the English keyboard before `type` (`key CTRL+SPACE` cycles; confirm with a screenshot).
 - `⌘+Space` occasionally does not open Spotlight on the first press.
@@ -394,6 +402,7 @@ The services quit on their own after 10 idle minutes.
 
 ## 12. Pitfalls (for people who want to change the code)
 
+- **An uppercase letter in a chord used to mean Shift+letter.** `KP GUI+V` went out as ⌘⇧V (paste and match style), which does nothing in the Spotlight field, and we spent a while blaming the clipboard. The Mac-side `enc_key` now lowercases letters inside chords, and firmware 0.3.0 no longer implies Shift there either (write `SHIFT+` explicitly).
 - **Camera and Bluetooth permissions are granted per app.** Claude Code's host process is hardened-runtime with no camera entitlement; a child process asking for camera access is silently refused by TCC (no prompt, state stuck at notDetermined). Hence the capture service is packaged as `HIL Capture.app`. CoreBluetooth is stricter still: **the executable itself** must live in a bundle with `NSBluetoothAlwaysUsageDescription`, and a shell wrapper that `exec`s the venv's python is SIGABRTed outright (exit code 134). So `HIL Link.app`'s executable is a native launcher compiled from `tools/launcher.c` that `dlopen`s libpython and runs `hil.link_server` in-process.
 - **The iOS capture device reports no formats** (0x0 @ 0 fps); don't set `activeFormat`, read the resolution from the first frame. On macOS the session resets the device format to the preset's 1080p before `startRunning`; the fix is the same as ffmpeg's: set the format after `lockForConfiguration` and **keep the lock** until after `startRunning`.
 - **`CMSampleBuffer` in pyobjc callbacks is a raw pointer** (PyObjCPointer), not bridged to a CF object; all frame handling goes through ctypes into CoreMedia / CoreVideo. A Python exception inside a callback becomes an NSException that aborts the process, so every delegate method is wrapped in `_safe`.

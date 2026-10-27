@@ -171,6 +171,8 @@ tests/                 协议 / 固件模型 / 定位闭环（仿真）
 
 两个 `.app` 都是**按需拉起、空闲 10 分钟自动退出**的常驻服务：任何一条 `hil` 命令发现服务没起就会 `open -g` 它，取帧和蓝牙各约 2 秒就绪。取帧服务只把「取帧」算作活动，链路服务只把「发命令」算作活动，单纯查状态不续命。资源本身很小（合计约 30 MB 内存、CPU 接近 0），自动退出主要是省 iPhone 的电——采集在跑时手机一直在做镜像输出。
 
+板子侧也有空闲（固件 0.3.0 起）：**120 秒没收到操作命令就放开 iPhone 并停止广播**。原因是 iOS 只要连着一个蓝牙键盘就把所有 App 的屏幕键盘藏起来——板子常年挂在手机上，用户自己就再也弹不出键盘。下一条命令会叫醒板子重新广播，iPhone 通常 1~3 秒自动连回来；没连回来时 `hil up` 和各条命令会直接提示你到 iPhone 设置→蓝牙里点一下 HIL-Bridge（绑定还在，点完立刻连上），不会反复重试。守护进程退出后板子没有广播，新起的守护进程连不上时提示给板子断电重启。时限用串口 `CFG hididle <秒>` 改，0 为一直连着（见 `firmware/FLASH.md`）。
+
 ---
 
 ## 5. 能做什么、不做什么
@@ -322,7 +324,7 @@ Claude 会自己 `hil up`、截图、点、再截图，并在要密码 / 付款 
 
 ## 11. 已知限制与待做
 
-- **中文输入没有可用方案。** 蓝牙键盘只发 ASCII；中文本来打算走「Mac 剪贴板 → 通用剪贴板 → iPhone ⌘+V」，需要两端都开「接力」，目前没验证。实践里靠列表、索引栏、菜单绕开输入；需要搜中文时让用户在手机上打。
+- **中文输入走通用剪贴板，慢但可用。** 蓝牙键盘只发 ASCII；非 ASCII 用 `paste`：Mac `pbcopy` → 通用剪贴板 → iPhone 上 ⌘V，两端都要开「接力」。实测 iPhone 是收到 ⌘V 时才去拉 Mac 的剪贴板，而且要先收到 Mac 的蓝牙广播：复制后等 2 s 常常落空（什么都不粘），4~5 s 才稳；Mac 上的复制 2 分钟后过期。所以 `paste` 每次重新复制、默认等 5 s，粘贴后要截图确认，没出来隔 3 s 再发一次 ⌘V。能走列表、索引栏、菜单就不输入。
 - **滚轮负方向无效**（往上翻不动，原因待查），往上用 `drag` 或方向键。
 - 中文拼音键盘会把字母吃进拼音合成、把数字当候选；`type` 前要切到英文键盘（`key CTRL+SPACE` 轮换后看截图确认）。
 - `⌘+Space` 打开 Spotlight 偶尔第一下不响应。
@@ -334,6 +336,7 @@ Claude 会自己 `hil up`、截图、点、再截图，并在要密码 / 付款 
 
 ## 12. 踩过的坑（给想改代码的人）
 
+- **组合键里的大写字母会被固件当成 Shift+字母。** `KP GUI+V` 发出去是 ⌘⇧V（粘贴并匹配样式），Spotlight 搜索框里毫无反应，排查了半天剪贴板。Mac 端 `enc_key` 现在把组合键里的字母统一转小写，固件 0.3.0 起组合键里的字母也不再隐含 Shift（要 Shift 显式写 `SHIFT+`）。
 - **相机 / 蓝牙权限按 App 归属。** Claude Code 的宿主进程是 hardened runtime 且没有相机 entitlement，子进程申请相机权限被 TCC 静默拒绝（不弹框、状态停在 notDetermined）。所以采集服务打包成 `HIL Capture.app`。CoreBluetooth 更严：要求**可执行文件本身**所在的 bundle 带 `NSBluetoothAlwaysUsageDescription`，shell 壳 `exec` 出 venv 的 python 会被直接 SIGABRT（退出码 134），所以 `HIL Link.app` 的可执行文件是 `tools/launcher.c` 编出来的原生启动器，`dlopen` libpython 在本进程里跑 `hil.link_server`。
 - **iOS 采集设备不报格式**（0x0 @ 0 fps），别去设 `activeFormat`；分辨率从首帧读。macOS 下 session 在 `startRunning` 前会把设备格式改回 preset 对应的 1080p，解法同 ffmpeg：`lockForConfiguration` 后设格式**不解锁**，`startRunning` 之后再解锁。
 - **pyobjc 回调里的 `CMSampleBuffer` 是裸指针**（PyObjCPointer），没桥接成 CF 对象；帧处理全程用 ctypes 调 CoreMedia / CoreVideo，并且回调里的 Python 异常会变成 NSException 把进程 abort，所有 delegate 方法都包了一层 `_safe`。

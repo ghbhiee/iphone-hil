@@ -80,14 +80,17 @@ class Link:
         for i in range(0, len(text), chunk):
             self._must(P.enc_text(text[i:i + chunk]))
 
-    def paste_text(self, text: str, settle: float = 1.5) -> None:
+    def paste_text(self, text: str, settle: float = 5.0) -> None:
         """任意文本（含中文）：Mac 剪贴板 → 通用剪贴板(Handoff) 同步到 iPhone → Cmd+V。
-        前提：Mac 与 iPhone 同一 Apple ID、都开了 Handoff、蓝牙/WiFi 开着；通用剪贴板同步通常 1~2 秒。"""
+        前提：Mac 与 iPhone 同一 Apple ID、都开了「接力」、蓝牙/WiFi 开着。
+        实测（2026-10-27）：iPhone 是在收到 ⌘V 时才去拉 Mac 的剪贴板，而且要先收到 Mac 的蓝牙广播；
+        复制后等 2 s 常常还没收到（⌘V 落空、什么都不粘），等 4~5 s 稳定；Mac 上的复制 2 分钟后过期，所以每次都重新 pbcopy。
+        调用方粘贴后截图确认；没出来就隔 3 s 再发一次 key("GUI+v")（别盲发，成功时会粘两遍）。"""
         import os
         env = dict(os.environ, LANG="en_US.UTF-8", LC_ALL="en_US.UTF-8")  # pbcopy 按 locale 解码，没有 UTF-8 locale 时中文会变乱码
         subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True, env=env)
         time.sleep(settle)
-        self.key("GUI+V")
+        self.key("GUI+v")  # 小写：大写会被固件当成 Shift+v，变成 ⌘⇧V（粘贴并匹配样式），搜索框等地方没反应
 
     def consumer(self, name: str) -> Reply:
         return self._must(P.enc_consumer(name))
@@ -201,8 +204,9 @@ class FirmwareModel:
     def __init__(self, hid=None, backend: str = "ble", name: str = "HIL Bridge"):
         self.hid = hid
         self.backend, self.name = backend, name
-        self.cfg = {"mvdelay": 25, "typedelay": 12}
+        self.cfg = {"mvdelay": 25, "typedelay": 12, "hididle": 120}
         self.mods, self.keys, self.buttons = 0, [], 0
+        self.hid_awake = True   # 固件 0.3.0：空闲时主动断开 iPhone；桩里只记状态
         self.sleep = (lambda ms: None)  # 回环时不真等；想真实节奏可换成 time.sleep
 
     # --- HID 报告出口 ---
@@ -231,7 +235,19 @@ class FirmwareModel:
                 return "OK auth"
             if cmd == "ST":
                 conn = 1 if (self.hid is None or getattr(self.hid, "connected", True)) else 0
-                return f"OK conn={conn} backend={self.backend} name={self.name} mvdelay={self.cfg['mvdelay']} typedelay={self.cfg['typedelay']} txfail=0"
+                hid = "on" if conn else ("waking" if self.hid_awake else "idle")
+                return f"OK conn={conn} hid={hid} hididle={self.cfg['hididle']} idle=0 backend={self.backend} name={self.name} mvdelay={self.cfg['mvdelay']} typedelay={self.cfg['typedelay']} txfail=0"
+            if cmd == "WAKE":
+                self.hid_awake = True
+                conn = 1 if (self.hid is None or getattr(self.hid, "connected", True)) else 0
+                return f"OK wake conn={conn} hid={'on' if conn else 'waking'}"
+            if cmd == "SLEEP":
+                if self.cfg["hididle"] == 0:
+                    return "ERR hididle=0 or pairing mode (appearance!=0)"
+                self.hid_awake = False
+                return "OK sleep"
+            if cmd in ("MV", "BT", "CK", "LP", "WH", "KP", "KD", "KU", "TX", "CC"):
+                self.hid_awake = True   # 需要 HID 的命令算活动并唤醒
             if cmd == "MV":
                 dx, dy = int(toks[1]), int(toks[2])
                 for sx, sy in P.split_move(dx, dy):
@@ -397,6 +413,11 @@ class HttpLink(Link):
 
     def daemon_status(self) -> dict:
         with self._opener.open(self.BASE + "/status", timeout=5) as r:
+            return self._json.loads(r.read())
+
+    def wake(self, timeout: float = 15.0) -> dict:
+        """让板子向 iPhone 广播并等它的 HID 连回来。返回 {"conn": bool, "waited_s": 秒, "firmware": ST 字段}。"""
+        with self._opener.open(self.BASE + f"/wake?timeout={timeout}", timeout=timeout + 15) as r:
             return self._json.loads(r.read())
 
 

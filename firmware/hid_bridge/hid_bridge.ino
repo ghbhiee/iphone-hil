@@ -6,6 +6,11 @@
  * 协议定义在 ../../hil/protocol.py（唯一定义处），Python 参考实现在 hil/link.py 的 FirmwareModel。
  * 每行命令回一行 "OK ..." 或 "ERR ..."；以 '#' 开头的行是日志，Mac 端忽略。
  *
+ * HID 空闲（0.3.0 起）：iOS 只要连着一个蓝牙键盘就把所有 App 的屏幕键盘藏起来，所以板子不能常年挂在 iPhone 上。
+ *   hididle 秒（默认 120）没有需要 HID 的命令 → 断开 iPhone（不清绑定）→ 不再广播，直到收到 WAKE 或需要 HID 的命令
+ *   （来自串口或已连着的 Mac 指令通道）→ 恢复广播，iPhone 通常 1~3 s 自动连回来；没连回来就让用户到 iPhone 设置→蓝牙 点一下 HIL-Bridge。
+ *   上电时正常广播。空闲且 Mac 也没连着时板子对外没有广播，新起的守护进程连不上：给板子断电重启（或按 EN 键）即可。
+ *
  * 后端：
  *   HID_BACKEND=1  BLE HID（默认，推荐：iPhone 的 USB 口留给 Mac 录屏）。命令走 Serial（板子的 USB 口，Hardware CDC）。
  *   HID_BACKEND=2  USB HID（TinyUSB）：板子的 native USB 口插 iPhone/iPad；命令走 Serial0（UART 桥接口 "COM"）。
@@ -33,7 +38,7 @@
 #define BACKEND_NAME "usb"
 #endif
 
-#define FW_VERSION "0.2.3"
+#define FW_VERSION "0.3.1"
 #define DEFAULT_NAME "HIL-Bridge"
 #define BAUD 115200
 
@@ -45,6 +50,8 @@ struct Config {
   uint16_t appearance; // BLE 外观：0x03C2 鼠标 / 0x03C1 键盘 / 0x03C0 通用 HID
   char token[17];      // BLE 指令通道的口令（Mac 连上后要先 AUTH <token>）
   char hidpeer[20];    // 允许接收 HID 报告的对端地址（第一次订阅时自动记住 = iPhone），防止 Mac 接管
+  uint16_t hididle;    // 空闲多少秒后主动断开 iPhone 的 HID 连接（0 = 永不，即一直连着）。
+                       // 为什么：iOS 只要连着一个蓝牙键盘就把所有 App 的屏幕键盘藏起来；板子常年通电 = 手机永远弹不出键盘。
 } cfg;
 Preferences prefs;
 
@@ -56,6 +63,7 @@ static void loadConfig() {
   cfg.mvdelay = prefs.getUShort("mvdelay", 25);  // ≥ BLE 连接间隔，报告才不会在协议栈里排队（实测 8 会排队）
   cfg.typedelay = prefs.getUShort("typedelay", 12);
   cfg.appearance = prefs.getUShort("appear", 0);  // 0 = 通用外观（见 hidBegin 里的说明）
+  cfg.hididle = prefs.getUShort("hididle", 120);
   String t = prefs.getString("token", "");
   prefs.end();
   if (t.length() < 4) {  // 第一次启动：随机生成口令并存下来
@@ -78,6 +86,7 @@ static void saveConfig() {
   prefs.putUShort("appear", cfg.appearance);
   prefs.putString("token", cfg.token);
   prefs.putString("hidpeer", cfg.hidpeer);
+  prefs.putUShort("hididle", cfg.hididle);
   prefs.end();
 }
 
@@ -89,6 +98,20 @@ static volatile bool g_connected = false;  // 链路已连接
 static volatile bool g_ready = false;      // 可以发报告（BLE：已加密）
 static volatile bool g_evt_conn = false, g_evt_disc = false;  // 回调里置位，loop 里打日志
 static uint32_t g_txfail = 0;  // notify() 返回 false 的次数（排队满/未订阅）
+
+// ---- HID 空闲/唤醒（只对 BLE 后端有意义）----
+// 空闲：断开 iPhone，并停止广播，直到被 WAKE / 需要 HID 的命令唤醒。醒着（有活动）：正常广播，iPhone 按绑定自动连回来。
+static bool g_hidAwake = true;
+static uint32_t g_lastActMs = 0;        // 最近一次活动（需要 HID 的命令 / WAKE）
+static volatile bool g_evt_adv = false; // 连接数变了 / 状态变了：loop() 里重新决定广播（回调里不碰广播，避免两个任务抢）
+static volatile bool g_evt_idle = false, g_evt_wake = false;
+struct LogMsg { char s[96]; };
+static QueueHandle_t g_logQueue = nullptr;   // 回调任务里产生的日志行，loop() 里打到串口（诊断用）
+static void qlog(const char* fmt, ...) {
+  if (!g_logQueue) return;
+  LogMsg m; va_list ap; va_start(ap, fmt); vsnprintf(m.s, sizeof(m.s), fmt, ap); va_end(ap);
+  xQueueSend(g_logQueue, &m, 0);
+}
 
 // ---- 回复路由：命令来自串口还是 BLE 指令通道 ----
 enum Sink { SINK_SERIAL = 0, SINK_BLE = 1 };
@@ -139,17 +162,44 @@ static QueueHandle_t g_bleQueue = nullptr;               // BLE 收到的整行�
 static char g_bleBuf[300]; static size_t g_bleLen = 0;
 static uint32_t g_bleRxLines = 0, g_bleTxReplies = 0, g_bleWrites = 0;  // 对账用计数
 
-static void maybeAdvertise() {  // 没满两个连接就继续广播，让 iPhone 和 Mac 都能连上
-  if (g_server && g_server->getConnectedCount() < 2) NimBLEDevice::getAdvertising()->start();
+static const char* g_advMode = "off";   // 当前广播：pub / off（满了，或空闲中）
+
+static bool hidAlwaysOn() { return cfg.hididle == 0 || cfg.appearance != 0; }  // appearance≠0 = 正在给新 iPhone 配对，别睡
+
+// 按当前状态决定广播。只在 loop() 任务里调用。
+static void updateAdvertising() {
+  if (!g_server) return;
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->stop();
+  int n = g_server->getConnectedCount();
+  bool ok = false;
+  if (n >= 2) { g_advMode = "off"; }                              // iPhone + Mac 都在，满了
+  else if (!g_hidAwake && !hidAlwaysOn()) { g_advMode = "off"; }  // 空闲中：不广播，iPhone 就不会连回来把键盘藏掉
+  else { ok = adv->start(); g_advMode = "pub"; }
+  CMD_SERIAL.printf("# adv %s ok=%d conns=%d\n", g_advMode, ok ? 1 : 0, n);
 }
+static void hidGoIdle() {
+  if (!g_hidAwake) return;
+  g_hidAwake = false; g_evt_idle = true;
+  if (g_hidConn != BLE_HS_CONN_HANDLE_NONE) g_server->disconnect(g_hidConn);   // 保留绑定，只断连接；onDisconnect 会清状态
+  g_evt_adv = true;
+}
+static void hidWake() {   // 恢复广播 + 重置计时；iPhone 通常 1~3 s 自动连回来，没连就让用户到设置→蓝牙点一下
+  g_lastActMs = millis();
+  if (g_hidAwake) return;
+  g_hidAwake = true; g_evt_wake = true; g_evt_adv = true;
+}
+static const char* hidStateStr() { return g_ready ? "on" : (g_hidAwake || hidAlwaysOn()) ? "waking" : "idle"; }
 
 class MouseReportCB : public NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic* c, NimBLEConnInfo& ci, uint16_t subValue) override {
     std::string addr = ci.getIdAddress().toString();
+    qlog("# sub h=%d id=%s v=%d", ci.getConnHandle(), addr.c_str(), subValue);
     if (subValue & 1) {
       if (cfg.hidpeer[0] == 0) { strncpy(cfg.hidpeer, addr.c_str(), sizeof(cfg.hidpeer) - 1); saveConfig(); }  // 第一次：记住它
       if (strcasecmp(addr.c_str(), cfg.hidpeer) != 0) return;  // 不是记住的那台（比如 Mac 自己来配对）：不当 HID 目标
       g_hidConn = ci.getConnHandle(); g_ready = true; g_evt_conn = true;
+      g_hidAwake = true; g_lastActMs = millis();   // 用户手工点连也算醒来，hididle 从现在起算
     } else if (ci.getConnHandle() == g_hidConn) { g_hidConn = BLE_HS_CONN_HANDLE_NONE; g_ready = false; }
   }
 };
@@ -176,31 +226,40 @@ class NusRxCB : public NimBLECharacteristicCallbacks {
 class ServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, NimBLEConnInfo& ci) override {
     g_connected = true;
+    std::string id = ci.getIdAddress().toString();
+    bool isHid = cfg.hidpeer[0] == 0 || strcasecmp(id.c_str(), cfg.hidpeer) == 0;
+    qlog("# conn h=%d peer=%s id=%s hid=%d itvl=%d", ci.getConnHandle(), ci.getAddress().toString().c_str(), id.c_str(), isHid ? 1 : 0, ci.getConnInterval());
     // 请求短连接间隔（11.25~15 ms），鼠标才跟手；对方不接受就用它自己的
     s->updateConnParams(ci.getConnHandle(), 9, 12, 0, 400);
-    maybeAdvertise();
+    g_evt_adv = true;   // 还有空位就继续广播（由 loop 里的 updateAdvertising 决定用哪个地址）
+  }
+  void onConnParamsUpdate(NimBLEConnInfo& ci) override {
+    qlog("# params h=%d itvl=%d lat=%d to=%d", ci.getConnHandle(), ci.getConnInterval(), ci.getConnLatency(), ci.getConnTimeout());
   }
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& ci, int reason) override {
     uint16_t h = ci.getConnHandle();
+    qlog("# disc h=%d peer=%s reason=0x%x", h, ci.getAddress().toString().c_str(), reason);
     if (h == g_hidConn) { g_hidConn = BLE_HS_CONN_HANDLE_NONE; g_ready = false; g_evt_disc = true; }
     if (h == g_cmdConn) { g_cmdConn = BLE_HS_CONN_HANDLE_NONE; }
     g_connected = s->getConnectedCount() > 1;  // 回调时本连接还计在内
-    maybeAdvertise();
+    g_evt_adv = true;
   }
   void onAuthenticationComplete(NimBLEConnInfo& ci) override {
     // 不再因为未加密就断开：Mac 的指令连接本来就不加密；iPhone 的 HID 由 iOS 自己要求加密
+    qlog("# auth h=%d enc=%d bonded=%d", ci.getConnHandle(), ci.isEncrypted() ? 1 : 0, ci.isBonded() ? 1 : 0);
   }
 };
 
 static void hidBegin() {
   g_bleQueue = xQueueCreate(8, sizeof(BleMsg));
+  g_logQueue = xQueueCreate(16, sizeof(LogMsg));
   NimBLEDevice::init(cfg.name);
   NimBLEDevice::setMTU(247);                                      // 回复一行可达 ~80 字节，别卡在 20 字节
   NimBLEDevice::setSecurityAuth(true, false, true);              // 绑定 + Secure Connections，Just Works（只有 iPhone 的 HID 会触发）
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
   g_server = NimBLEDevice::createServer();
   g_server->setCallbacks(new ServerCB());
-  g_server->advertiseOnDisconnect(true);
+  g_server->advertiseOnDisconnect(false);   // 广播由 updateAdvertising() 按醒/睡状态决定，不让库自己重开
   g_hid = new NimBLEHIDDevice(g_server);
   g_hid->setManufacturer("hil");
   g_hid->setPnp(0x02, 0xE502, 0xA111, 0x0210);
@@ -224,7 +283,8 @@ static void hidBegin() {
   else adv->addServiceUUID(NUS_SERVICE);
   adv->setName(cfg.name);
   adv->enableScanResponse(true);
-  adv->start();
+  g_hidAwake = true; g_lastActMs = millis();   // 上电正常广播：若 iPhone 还在找它（上次是断电/链路丢失）会连上，hididle 后再断
+  updateAdvertising();
 }
 static inline bool hidReady() { return g_ready; }
 static void hidMouse(int8_t dx, int8_t dy, int8_t wheel) {
@@ -295,6 +355,11 @@ static void hidConsumer(uint16_t usage) {
   Consumer.release();
 }
 static void bleReply(const char* s) {}
+static bool hidAlwaysOn() { return true; }
+static void hidGoIdle() {}
+static void hidWake() { g_lastActMs = millis(); }
+static void updateAdvertising() {}
+static const char* hidStateStr() { return g_ready ? "on" : "waking"; }
 #endif
 
 // ------------------------------------------------------------------ 键名表（和 protocol.py 一致）
@@ -353,7 +418,10 @@ static bool parseKeySpec(char* spec, uint8_t& mods, uint8_t& usage) {
     if (found) continue;
     for (auto& k : KEY_NAMES) if (strieq(tok, k.name)) { if (usage) return false; usage = k.usage; found = true; break; }
     if (found) continue;
-    if (strlen(tok) == 1) { uint8_t m; if (!asciiToUsage(tok[0], m, usage)) return false; mods |= m; continue; }
+    if (strlen(tok) == 1) {  // 组合键里的字母不区分大小写、不隐含 Shift：GUI+V 就是 ⌘V（0.2.3 及之前会发成 ⌘⇧V）；要 Shift 请显式写 SHIFT+
+      char c = tok[0]; if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+      uint8_t m; if (!asciiToUsage(c, m, usage)) return false; mods |= m; continue;
+    }
     return false;
   }
   return true;
@@ -409,7 +477,7 @@ static void reply(const char* s) {
   if (g_sink == SINK_BLE) bleReply(s); else CMD_SERIAL.println(s);
 }
 static void replyf(const char* fmt, ...) {
-  char b[200];
+  char b[300];   // ST 一行现在接近 200 字节，别截断（BLE 回复按 MTU 分片，串口无所谓）
   va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof(b), fmt, ap); va_end(ap);
   reply(b);
 }
@@ -421,6 +489,7 @@ static void handleLine(char* line) {
   if (!n) { reply("ERR empty"); return; }
   // TX 需要整行剩余部分，先单独处理
   if ((line[0] == 'T' || line[0] == 't') && (line[1] == 'X' || line[1] == 'x') && (line[2] == ' ' || line[2] == 0)) {
+    hidWake();
     if (!hidReady()) { reply("ERR not connected"); return; }
     char* text = line + (line[2] ? 3 : 2);
     unescape(text);
@@ -442,17 +511,35 @@ static void handleLine(char* line) {
   char* a3 = strtok_r(nullptr, " ", &save);
   if (strieq(cmd, "PING")) { reply("OK PONG"); return; }
   if (strieq(cmd, "ST")) {
-    if (g_sink == SINK_SERIAL)
-      replyf("OK conn=%d backend=%s name=%s mvdelay=%u typedelay=%u txfail=%lu fw=%s via=serial hidpeer=%s token=%s", hidReady() ? 1 : 0, BACKEND_NAME, cfg.name, cfg.mvdelay, cfg.typedelay, (unsigned long)g_txfail, FW_VERSION, cfg.hidpeer[0] ? cfg.hidpeer : "-", cfg.token);
-    else
-      replyf("OK conn=%d backend=%s name=%s mvdelay=%u typedelay=%u txfail=%lu fw=%s via=ble hidpeer=%s blew=%lu bler=%lu blet=%lu", hidReady() ? 1 : 0, BACKEND_NAME, cfg.name, cfg.mvdelay, cfg.typedelay, (unsigned long)g_txfail, FW_VERSION, cfg.hidpeer[0] ? cfg.hidpeer : "-", (unsigned long)g_bleWrites, (unsigned long)g_bleRxLines, (unsigned long)g_bleTxReplies);
+    unsigned long idleS = (millis() - g_lastActMs) / 1000UL;
+#if HID_BACKEND == 1
+    int conns = g_server ? g_server->getConnectedCount() : 0; const char* advm = g_advMode;
+#else
+    int conns = g_connected ? 1 : 0; const char* advm = "-";
+#endif
+#if HID_BACKEND == 1
+    if (g_sink == SINK_BLE) {
+      replyf("OK conn=%d hid=%s hididle=%u idle=%lu conns=%d adv=%s backend=%s name=%s mvdelay=%u typedelay=%u txfail=%lu fw=%s via=ble hidpeer=%s blew=%lu bler=%lu blet=%lu", hidReady() ? 1 : 0, hidStateStr(), cfg.hididle, idleS, conns, advm, BACKEND_NAME, cfg.name, cfg.mvdelay, cfg.typedelay, (unsigned long)g_txfail, FW_VERSION, cfg.hidpeer[0] ? cfg.hidpeer : "-", (unsigned long)g_bleWrites, (unsigned long)g_bleRxLines, (unsigned long)g_bleTxReplies);
+      return;
+    }
+#endif
+    replyf("OK conn=%d hid=%s hididle=%u idle=%lu conns=%d adv=%s backend=%s name=%s mvdelay=%u typedelay=%u txfail=%lu fw=%s via=serial hidpeer=%s token=%s", hidReady() ? 1 : 0, hidStateStr(), cfg.hididle, idleS, conns, advm, BACKEND_NAME, cfg.name, cfg.mvdelay, cfg.typedelay, (unsigned long)g_txfail, FW_VERSION, cfg.hidpeer[0] ? cfg.hidpeer : "-", cfg.token);
     return;
+  }
+  if (strieq(cmd, "WAKE")) {    // 让板子向 iPhone 广播（iPhone 按绑定自动重连），并重置空闲计时；conn=1 表示已经连着
+    hidWake(); replyf("OK wake conn=%d hid=%s", hidReady() ? 1 : 0, hidStateStr()); return;
+  }
+  if (strieq(cmd, "RESTART")) { reply("OK restart"); CMD_SERIAL.flush(); delay(50); esp_restart(); }   // 硬复位（等于断电重启，绑定/配置都在）
+  if (strieq(cmd, "SLEEP")) {   // 立刻断开 iPhone 的 HID 连接并停止广播（屏幕键盘马上恢复）；hididle=0 时无效
+    if (hidAlwaysOn()) { reply("ERR hididle=0 or pairing mode (appearance!=0)"); return; }
+    hidGoIdle(); reply("OK sleep"); return;
   }
   if (strieq(cmd, "CFG")) {
     if (!a1 || !a2) { reply("ERR bad args"); return; }
     if (strieq(a1, "mvdelay")) cfg.mvdelay = atoi(a2);
     else if (strieq(a1, "typedelay")) cfg.typedelay = atoi(a2);
     else if (strieq(a1, "appearance")) cfg.appearance = (uint16_t)strtol(a2, nullptr, 0);
+    else if (strieq(a1, "hididle")) cfg.hididle = (uint16_t)atoi(a2);
     else if (strieq(a1, "name")) { strncpy(cfg.name, a2, sizeof(cfg.name) - 1); cfg.name[sizeof(cfg.name) - 1] = 0; }
     else if (strieq(a1, "token")) { if (g_sink != SINK_SERIAL) { reply("ERR token only via serial"); return; } strncpy(cfg.token, a2, sizeof(cfg.token) - 1); cfg.token[sizeof(cfg.token) - 1] = 0; }
     else if (strieq(a1, "hidpeer")) { if (strieq(a2, "clear")) cfg.hidpeer[0] = 0; else { strncpy(cfg.hidpeer, a2, sizeof(cfg.hidpeer) - 1); cfg.hidpeer[sizeof(cfg.hidpeer) - 1] = 0; } }
@@ -468,10 +555,14 @@ static void handleLine(char* line) {
 #endif
     else { replyf("ERR unknown cfg %s", a1); return; }
     saveConfig();
+    if (strieq(a1, "hididle")) { if (hidAlwaysOn()) hidWake(); else g_evt_adv = true; }   // 改成 0 立刻恢复常连；否则按新时限计
     replyf("OK cfg %s%s", a1, (strieq(a1, "name") || strieq(a1, "appearance")) ? " (reboot to apply)" : "");
     return;
   }
   if (strieq(cmd, "RL")) { releaseAll(); reply("OK rl"); return; }
+  // 往下都是需要 iPhone 连着的命令：算一次活动（重置空闲计时），空闲中就先唤醒（开始向 iPhone 广播）。
+  // iPhone 连回来要 1~3 s，这期间回 ERR not connected，Mac 端守护进程会等 conn=1 再重发。
+  hidWake();
   if (!hidReady()) { reply("ERR not connected"); return; }
 
   if (strieq(cmd, "MV")) {
@@ -545,6 +636,7 @@ void setup() {
   CMD_SERIAL.printf("# hid_bridge %s backend=%s name=%s token=%s\n", FW_VERSION, BACKEND_NAME, cfg.name, cfg.token);
 }
 
+#if HID_BACKEND == 1
 static void handleBleLine(uint16_t conn, char* line) {
   g_sink = SINK_BLE; g_sinkConn = conn;
   // 先处理 AUTH：口令对了这条连接才算指令连接
@@ -560,13 +652,21 @@ static void handleBleLine(uint16_t conn, char* line) {
   }
   g_sink = SINK_SERIAL; g_sinkConn = BLE_HS_CONN_HANDLE_NONE;
 }
+#endif
 
 void loop() {
   if (g_evt_conn) { g_evt_conn = false; CMD_SERIAL.println("# connected"); }
   if (g_evt_disc) { g_evt_disc = false; CMD_SERIAL.println("# disconnected"); }
+  if (g_evt_idle) { g_evt_idle = false; CMD_SERIAL.println("# hid idle"); }
+  if (g_evt_wake) { g_evt_wake = false; CMD_SERIAL.println("# hid wake"); }
 #if HID_BACKEND == 1
+  LogMsg lm;
+  while (g_logQueue && xQueueReceive(g_logQueue, &lm, 0) == pdTRUE) CMD_SERIAL.println(lm.s);
   BleMsg m;
   while (g_bleQueue && xQueueReceive(g_bleQueue, &m, 0) == pdTRUE) handleBleLine(m.conn, m.line);
+  // 空闲计时：醒着且超过 hididle 秒没活动 → 断开 iPhone、停止向它广播
+  if (!hidAlwaysOn() && g_hidAwake && (uint32_t)(millis() - g_lastActMs) > (uint32_t)cfg.hididle * 1000UL) hidGoIdle();
+  if (g_evt_adv) { g_evt_adv = false; updateAdvertising(); }
 #endif
   while (CMD_SERIAL.available()) {
     char c = (char)CMD_SERIAL.read();

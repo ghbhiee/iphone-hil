@@ -6,7 +6,17 @@
 接口（127.0.0.1:8766）：
   GET /cmd?line=MV%2010%2010   → {"ok":true,"text":"mv 10 10","raw":"OK mv 10 10"}
   GET /status                  → 串口、固件 ST、最近错误
+  GET /wake?timeout=15         → 让板子向 iPhone 广播并等 iPhone 的 HID 连回来（ST conn=1）
+  GET /sleep                   → 让板子立刻放开 iPhone（屏幕键盘马上恢复）
   GET /quit
+
+板子的 HID 空闲（固件 ≥0.3.0）：板子 hididle 秒（默认 120）没收到需要 HID 的命令就主动断开 iPhone 并停止广播，
+iPhone 的屏幕键盘才会恢复（iOS 连着蓝牙键盘时藏掉所有 App 的屏幕键盘）。所以这里：
+  - 链路一打开就发 WAKE，板子恢复广播，iPhone 通常 1~3 s 连回来；
+  - /cmd 收到 "ERR not connected" 且命令需要 HID 时，等 iPhone 连回来（最多 hid_wake_timeout_s）再重发一次，
+    等不到就回「请到 iPhone 设置→蓝牙 点一下 HIL-Bridge」；
+  - 退出前发 SLEEP（板子立刻放开 iPhone、停止广播）。之后板子只能被串口或下一次上电叫醒：
+    新起的守护进程连不上时，提示用户给板子断电重启。
 """
 from __future__ import annotations
 
@@ -37,6 +47,35 @@ class S:
     n_cmd = 0
     last_activity = time.time()
     idle_quit_min = 10.0
+    hid_wake_timeout = 20.0   # 等 iPhone HID 连回来的上限（秒）；hil.json 的 hid_wake_timeout_s
+    last_wake_s: float | None = None   # 最近一次唤醒等了多久（诊断）
+
+
+HID_CMDS = {"MV", "BT", "CK", "LP", "WH", "KP", "KD", "KU", "TX", "CC"}   # 需要 iPhone 连着的命令（和固件 handleLine 的顺序一致）
+
+
+def needs_hid(line: str) -> bool:
+    return line.split(" ", 1)[0].upper() in HID_CMDS
+
+
+def wait_hid(timeout: float) -> tuple[bool, float]:
+    """发 WAKE 让板子向 iPhone 广播，然后轮询 ST 直到 conn=1。调用方需持有 S.lock。返回 (连上了吗, 等了几秒)。"""
+    t0 = time.time()
+    r = S.link.send("WAKE")
+    if r.ok and r.fields.get("conn") == "1":
+        return True, 0.0
+    if not r.ok:
+        print(f"[link] WAKE → {r.raw}", flush=True)   # 旧固件没有 WAKE（ERR unknown cmd）：只能干等
+    while time.time() - t0 < timeout:
+        time.sleep(0.4)
+        try:
+            if S.link.status().get("conn") == "1":
+                waited = time.time() - t0
+                S.last_wake_s = waited
+                return True, waited
+        except LinkError:
+            pass
+    return False, time.time() - t0
 
 
 def open_link():
@@ -61,8 +100,15 @@ def _open_link_locked():
                 S.link = SerialLink(port=S.port)
             S.err = None
             print(f"[link] 已打开 {S.link.port}", flush=True)
+            try:   # 守护进程起来 = 马上要用：先让板子叫 iPhone 连回来，第一条命令就不用等
+                r = S.link.send("WAKE")
+                print(f"[link] WAKE → {r.raw}", flush=True)
+            except Exception as e:  # noqa
+                print(f"[link] WAKE 失败: {e}", flush=True)
         except Exception as e:  # noqa
             S.err = f"{type(e).__name__}: {e}"
+            if S.transport == "ble" and "没连上" in str(e):   # 固件 ≥0.3.1：板子空闲时不广播，只有连着的 Mac 或串口能叫醒它
+                S.err += "。板子可能在空闲中（空闲后不广播）：给板子断电重启或按一下 EN 键，再跑一次命令"
             print(f"[link] 打开失败: {S.err}", flush=True)
 
 
@@ -96,7 +142,27 @@ class H(BaseHTTPRequestHandler):
                                     "ble_lines": getattr(S.link, "n_lines", None), "ble_extra": getattr(S.link, "n_extra", None),
                                     "ble_notif": getattr(S.link, "n_notif", None), "ble_writes": getattr(S.link, "n_writes", None),
                                     "idle_s": round(time.time() - S.last_activity), "idle_quit_min": S.idle_quit_min,
+                                    "hid_wake_timeout_s": S.hid_wake_timeout, "last_wake_s": S.last_wake_s,
                                     "ports_seen": find_serial_ports()})
+        if u.path in ("/wake", "/sleep"):
+            if S.link is None:
+                return self._json(503, {"ok": False, "text": S.err or "link not open"})
+            try:
+                with S.lock:
+                    if u.path == "/sleep":
+                        r = S.link.send("SLEEP")
+                        return self._json(200, {"ok": r.ok, "raw": r.raw})
+                    t = float(q.get("timeout", S.hid_wake_timeout))
+                    ok, waited = wait_hid(t)
+                    st = None
+                    try:
+                        st = S.link.status()
+                    except LinkError:
+                        pass
+                    return self._json(200, {"ok": ok, "conn": ok, "waited_s": round(waited, 1), "firmware": st})
+            except LinkError as e:
+                S.err = str(e)
+                return self._json(503, {"ok": False, "text": str(e)})
         if u.path == "/reopen":
             open_link(); return self._json(200 if S.link else 503, {"ok": S.link is not None, "error": S.err})
         if u.path == "/unpair":
@@ -125,10 +191,23 @@ class H(BaseHTTPRequestHandler):
                 if S.link is None:
                     return self._json(503, {"ok": False, "text": S.err or "link not open"})
             try:
+                waited = None
                 with S.lock:
                     r = S.link.send(line)
+                    if not r.ok and r.text.lower().startswith("not connected") and needs_hid(line):
+                        # 板子空闲中刚被这条命令唤醒：等 iPhone 的 HID 连回来再发一次
+                        ok, waited = wait_hid(S.hid_wake_timeout)
+                        if ok:
+                            r = S.link.send(line)
+                        else:
+                            S.n_cmd += 1
+                            return self._json(503, {"ok": False, "hid_wait_s": round(waited, 1),
+                                                    "text": "iPhone 的 HID 没连上：请到 iPhone 设置→蓝牙 点一下 HIL-Bridge（板子空闲时放开了它，这次没有自动连回来）"})
                 S.n_cmd += 1
-                return self._json(200, {"ok": r.ok, "text": r.text, "raw": r.raw})
+                d = {"ok": r.ok, "text": r.text, "raw": r.raw}
+                if waited is not None:
+                    d["hid_wait_s"] = round(waited, 1)
+                return self._json(200, d)
             except LinkError as e:
                 S.err = str(e)
                 return self._json(503, {"ok": False, "text": str(e)})  # BLE 掉线由主循环负责重连
@@ -143,6 +222,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     cfg = C.load()
     S.idle_quit_min = a.idle if a.idle is not None else float(cfg.get("idle_quit_min", 10))
+    S.hid_wake_timeout = float(cfg.get("hid_wake_timeout_s", 20))
     S.last_activity = time.time()
     S.port = a.port or cfg.get("port")
     S.transport = a.transport or cfg.get("link_transport", "serial")
@@ -170,6 +250,13 @@ def main(argv=None):
                 time.sleep(2)
     finally:
         if S.link:
+            if S.lock.acquire(timeout=3):   # 退出前让板子立刻放开 iPhone（屏幕键盘马上恢复），不用等板子自己的 hididle
+                try:
+                    S.link.send("SLEEP")
+                except Exception:
+                    pass
+                finally:
+                    S.lock.release()
             S.link.close()
         print("[link] bye", flush=True)
         os._exit(0)

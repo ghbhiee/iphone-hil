@@ -61,5 +61,6 @@
  "ble_token": null,
  "link_transport": "ble",
  "ble_name": "HIL-Bridge",
- "idle_quit_min": 10
+ "idle_quit_min": 10,
+ "hid_wake_timeout_s": 20
 }

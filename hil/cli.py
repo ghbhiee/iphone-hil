@@ -94,7 +94,7 @@ def main(argv=None):
     p = sub.add_parser("long"); p.add_argument("x", type=float); p.add_argument("y", type=float); p.add_argument("ms", nargs="?", type=int, default=800)
     p = sub.add_parser("drag"); [p.add_argument(n, type=float) for n in ("x0", "y0", "x1", "y1")]
     p = sub.add_parser("type"); p.add_argument("text")
-    p = sub.add_parser("paste"); p.add_argument("text")
+    p = sub.add_parser("paste"); p.add_argument("text"); p.add_argument("--settle", type=float, default=None, help="复制后等几秒再按 ⌘V（默认 5）")
     p = sub.add_parser("key"); p.add_argument("spec"); p.add_argument("n", nargs="?", type=int, default=1)
     p = sub.add_parser("cc"); p.add_argument("name")
     p = sub.add_parser("wheel"); p.add_argument("n", type=int)
@@ -152,7 +152,18 @@ def main(argv=None):
                     time.sleep(1)
             ds = lk.daemon_status()
             if fw:
-                print("link:", ds.get("transport"), ds.get("port"), "| 固件", fw.get("fw"), "| iPhone HID", "已连" if fw.get("conn") == "1" else "未连")
+                hid = "已连"
+                if fw.get("conn") != "1":   # 板子空闲时主动放开了 iPhone（固件 ≥0.3.0）：叫它连回来，通常 1~3 s
+                    w = lk.wake(timeout=15)
+                    if w.get("conn"):
+                        hid = f"已连（唤醒用了 {w.get('waited_s')} s）"
+                        fw = w.get("firmware") or fw
+                    else:
+                        hid = "未连。iPhone 的 HID 没连上：请到 iPhone 设置→蓝牙 点一下 HIL-Bridge（板子空闲时放开了它，这次没有自动连回来）；点完再跑一次 hil up"
+                print("link:", ds.get("transport"), ds.get("port"), "| 固件", fw.get("fw"), "| iPhone HID", hid)
+                hididle = fw.get("hididle")
+                if hididle and hididle != "0":
+                    print(f"板子空闲 {hididle} s 没收到操作命令会主动放开 iPhone（屏幕键盘恢复）；再用时任何命令会叫醒它，iPhone 通常自己连回来，没连就按提示去设置→蓝牙点一下。")
             else:
                 print("link:", ds.get("transport"), "ERROR", ds.get("error"))
         except Exception as e:
@@ -211,7 +222,7 @@ def main(argv=None):
         elif a.cmd == "type":
             link.type_text(a.text); print("typed", len(a.text))
         elif a.cmd == "paste":
-            link.paste_text(a.text); print("pasted", len(a.text))
+            link.paste_text(a.text, **({"settle": a.settle} if a.settle is not None else {})); print("pasted", len(a.text))
         elif a.cmd == "key":
             print(link.key(a.spec, a.n).raw)
         elif a.cmd == "cc":

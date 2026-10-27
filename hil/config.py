@@ -20,6 +20,7 @@ DEFAULT = {
     "capture": "remote",       # remote | sim
     "brain_scale": 0.5,        # 给大脑看的截图缩放；tap 坐标按这个缩放换算
     "idle_quit_min": 10,       # 两个守护进程空闲多少分钟自动退出（0=永不）；下次任何命令会自动拉起
+    "hid_wake_timeout_s": 20,  # 板子空闲放开 iPhone 后，第一条命令等 iPhone 的 HID 连回来的上限（秒）
     "pointer": asdict(PointerSpec()),
     "loc": asdict(LocCfg()),
     "calib": asdict(Calib()),

@@ -26,7 +26,7 @@ arduino-cli compile --fqbn "$FQBN" "${EXTRA[@]}" --output-dir "$OUT" hid_bridge
 echo "固件: $OUT/hid_bridge.ino.bin  (merged: $OUT/hid_bridge.ino.merged.bin)"
 if [[ "$1" == "--upload" ]]; then
   # 只刷 app 分区，保留 NVS（蓝牙绑定 + CFG 配置）。先停掉串口守护进程。
-  curl -s --max-time 2 http://127.0.0.1:8766/quit >/dev/null 2>&1; sleep 1
+  curl -s --max-time 2 http://127.0.0.1:8766/quit >/dev/null 2>&1 || true; sleep 1   # 守护进程没跑时 curl 非零，别让 set -e 把刷写跳掉
   PORT="${2:-$(ls /dev/cu.usbmodem* /dev/cu.usbserial* /dev/cu.wchusbserial* 2>/dev/null | head -1)}"
   CHIP=esp32; [[ "$VARIANT" != "esp32" ]] && CHIP=esp32s3
   esptool.py --chip $CHIP --port "$PORT" --baud 460800 --before default_reset --after hard_reset write_flash 0x10000 "$OUT/hid_bridge.ino.bin"
