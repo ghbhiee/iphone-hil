@@ -22,6 +22,21 @@ a Mac→ESP32 command takes 30 ms median, 200 commands in a row with zero failur
 official account, going through "Outpatient services → Lab reports", and opening eight reports one after another to read them out:
 ten taps in total, none missed, not a single character typed.
 
+> ### ⚠️ Three things to know before you use it (all iOS behaviour, not bugs)
+>
+> **1. While the board is connected, your own on-screen keyboard won't come up.**
+> iOS hides the on-screen keyboard in every app whenever **any Bluetooth keyboard** is connected — and to the phone the board *is* a Bluetooth
+> keyboard. So a board that stays connected leaves you unable to type on your own phone. This project deliberately does **not** keep it connected.
+>
+> **2. The board "sleeps" and releases the phone, so the keyboard comes back.**
+> When you're not using the tool the board is in normal mode; after **120 s** with no input command it drops its Bluetooth connection to the iPhone
+> and your on-screen keyboard **returns immediately**. To release it right away: `hil stop` or `hil normal`. It's just a BLE peripheral — leave it on a charger.
+>
+> **3. Each time you want to use it, you connect Bluetooth by hand (iOS won't let a peripheral reconnect itself).**
+> This is a hard iOS constraint: the phone (central) decides what to connect to; the board (peripheral) cannot pull the phone back, and software can't
+> force it. So when you start a session the tool (`hil up`) puts the board into a connectable state and prompts you: on the iPhone, go to
+> **Settings → Bluetooth** and tap the device named **`HIL-Bridge`**. Once connected it stays connected for the session; run `hil stop` when done.
+
 ---
 
 ## Contents
@@ -241,16 +256,29 @@ minutes) switches back to normal mode, releases the iPhone, and the on-screen ke
 
 ## 5. What it does and what it refuses to do
 
-**Target scenarios**: the everyday errands that exist only inside a phone app or mini program, done by an agent on your behalf:
+**When it fits**: the information or the entry point lives **only inside a phone app / mini program** — no web page, API or desktop client reaches
+it — and you're fine with "look at the screen and tap" (slow, but reliable and never over-reaching). Grouped by purpose:
 
-- Food delivery and shopping: find the shop or product you described, add to cart, compare prices, stop before payment for your confirmation.
-- Appointments and reports: check schedules and book in a hospital's official account / mini program; open lab reports one by one and tabulate them.
-- Utilities, property fees, social insurance: read bills and usage in the payment mini program.
-- Government apps: check application progress, read notices, fill in forms that involve no IDs or passwords.
-- Anything that starts with "can you look at that app on my phone and…".
+**① Read it out and tabulate it** — content an app only *shows* and won't export, read screen by screen and summarised:
+- Hospital accounts/mini programs: open lab reports one by one, scroll, read the conclusions, tabulate (tested: 8 reports).
+- Bills and usage: utilities, phone, property fees, credit-card / BNPL statements and monthly usage, read out and compared.
+- Orders and logistics: past orders, delivery status and spending detail from shopping/delivery apps, rolled up into a list.
+- Health apps: steps, sleep, checkup numbers that only render in the app, pulled into a table for trends.
 
-**Already done**: in WeChat, from Contacts, locate a hospital's service account via the alphabetical index (avoiding Chinese input), enter
-"Outpatient services → Lab reports", open eight reports in turn, scroll, and read out the conclusions.
+**② Run a fixed flow for you** — repetitive, tedious, app-only operations:
+- Appointments: check schedules in a hospital mini program and book the department/doctor/slot you named, **stopping before payment** to confirm.
+- Check-ins: sign in / collect points / check status in an app daily or on a schedule.
+- Status lookups: government apps — check progress, read notices, fill forms with no IDs or passwords.
+- Price-compare and order: find shops/products as you described, add to cart, compare, **stop before payment**.
+
+**③ Remote / on-behalf operation** — when you're not at the phone, or can't tap by hand:
+- Help an elderly family member operate a phone app remotely (you watch the screen on your computer and let the agent tap).
+- Tap, scroll and read on behalf of someone with limited mobility.
+
+**④ Carry data across apps / devices** — read something in one app, then put it elsewhere (into notes, emailed to yourself, into another form).
+
+**How to ask the agent**: just say "look at app X on my phone and…", "read out YY from X and tabulate it", or "book me an appointment in X,
+stop before payment". The agent screenshots, decides, taps, and screenshots again on its own.
 
 **Explicitly refused** (written into the skill's safety rules; copy them into your own agent prompts):
 
@@ -398,6 +426,7 @@ The services quit on their own after 10 idle minutes.
 
 ## 11. Known limitations and to-do
 
+- **While the board is connected you can't bring up the phone's on-screen keyboard, and connecting is a manual Bluetooth tap.** See "Three things to know before you use it" at the top: iOS hides every on-screen keyboard while a Bluetooth keyboard is connected, so leave the board asleep/released when not in use (auto-releases after 120 s idle, or `hil stop`); each time you want to use it, tap `HIL-Bridge` by hand in Settings → Bluetooth on the iPhone (iOS won't let a peripheral reconnect itself — this part cannot be automated; see `docs/IOS_RECONNECT_HANDOFF.md`).
 - **Chinese input goes through Universal Clipboard: slow but workable.** A Bluetooth keyboard only sends ASCII; for anything else use `paste`: Mac `pbcopy` → Universal Clipboard → `⌘V` on the iPhone, with Handoff enabled on both devices. Measured behaviour: the iPhone only fetches the Mac's clipboard when it receives `⌘V`, and only if it has already seen the Mac's Bluetooth advertisement. Pasting 2 s after the copy often does nothing at all; 4–5 s is reliable; a copy on the Mac expires after 2 minutes. So `paste` always copies fresh, waits 5 s by default, and the caller must confirm with a screenshot, re-sending `⌘V` once after 3 s if nothing appeared. Prefer lists, index bars and menus over typing whenever possible.
 - **Negative wheel direction has no effect** (cannot scroll up; cause unknown). Use `drag` or arrow keys to go up.
 - The Chinese Pinyin keyboard swallows letters into pinyin composition and treats digits as candidate selectors; switch to the English keyboard before `type` (`key CTRL+SPACE` cycles; confirm with a screenshot).
