@@ -14,7 +14,7 @@ PATH = os.environ.get("HIL_CONFIG", os.path.join(ROOT, "hil.json"))
 DEFAULT = {
     "port": None,              # 串口；None = 自动找 /dev/cu.usbmodem*
     "link": "serial",          # serial | loop | echo（serial = 经守护进程）
-    "link_transport": "serial",  # 守护进程到板子：serial | ble
+    "link_transport": "auto",  # 守护进程到板子：auto（板子 USB 插在 Mac 上就走串口，否则 BLE）| serial | ble
     "ble_name": "HIL-Bridge",
     "ble_token": None,         # 固件串口 `ST` 里的 token=
     "capture": "remote",       # remote | sim

@@ -120,6 +120,15 @@ class Link:
 _PORT_GLOBS = ["/dev/cu.usbmodem*", "/dev/cu.usbserial*", "/dev/cu.wchusbserial*", "/dev/cu.SLAB_USBtoUART*"]  # 串口自动发现
 
 
+def resolve_transport(transport: Optional[str], port: Optional[str] = None) -> str:
+    """auto → 板子的 USB 串口在（插在 Mac 上）就走串口，否则 BLE。
+    为什么优先串口：固件 0.3.3 以键盘身份广播，Mac 经 BLE 连它时 macOS 会自己试着配对、失败超时，
+    指令回复被压 30 s，严重时一直掉线重连直到板子复位；串口完全不经 macOS 蓝牙。"""
+    if transport in ("serial", "ble"):
+        return transport
+    return "serial" if (port or find_serial_ports()) else "ble"
+
+
 def find_serial_ports() -> list[str]:
     ports = []
     for g in _PORT_GLOBS:
@@ -402,7 +411,8 @@ class HttpLink(Link):
         from hil import config as C
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         os.makedirs(os.path.join(root, "captures"), exist_ok=True)
-        transport = C.load().get("link_transport", "serial")
+        cfg = C.load()
+        transport = resolve_transport(cfg.get("link_transport"), port or cfg.get("port"))
         if transport == "ble":
             app = os.path.expanduser("~/Applications/HIL Link.app")
             if not os.path.exists(app):  # 第一次用：生成 App 壳（蓝牙权限按 App 归属，第一次启动会弹授权框）

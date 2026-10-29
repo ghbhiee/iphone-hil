@@ -192,6 +192,10 @@ System Settings—and it must **not** be paired there, or macOS will claim it as
 to the first device that subscribes to mouse reports (the iPhone) and drops any other HID subscriber. (Firmware 0.3.3 advertises the HID
 appearance `0x3C2` by default — without it the iPhone doesn't list the board in Settings. Side effect: about 30 s after the Mac's link daemon
 connects, macOS tries to auto-pair, fails and times out, and the command channel stalls briefly; `hil up` waits it out.)
+**When the board's USB is plugged into the Mac, the link uses serial by default** (`link_transport: "auto"` in `hil.json`), bypassing
+macOS Bluetooth entirely; BLE is used only when no serial port is found (board on a charger). Over BLE, if commands keep timing out or
+the link drops 3 times within 2 minutes (it can stay stuck until the board resets), the daemon resets the board through the serial port
+and reconnects (if the port exists; otherwise it tells you to power-cycle the board).
 
 Serial (a USB cable to the board) remains available for flashing, reading the token and changing configuration.
 
