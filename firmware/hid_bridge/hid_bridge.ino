@@ -6,10 +6,11 @@
  * 协议定义在 ../../hil/protocol.py（唯一定义处），Python 参考实现在 hil/link.py 的 FirmwareModel。
  * 每行命令回一行 "OK ..." 或 "ERR ..."；以 '#' 开头的行是日志，Mac 端忽略。
  *
- * HID 空闲（0.3.0 起）：iOS 只要连着一个蓝牙键盘就把所有 App 的屏幕键盘藏起来，所以板子不能常年挂在 iPhone 上。
- *   hididle 秒（默认 120）没有需要 HID 的命令 → 断开 iPhone（不清绑定）→ 不再广播，直到收到 WAKE 或需要 HID 的命令
- *   （来自串口或已连着的 Mac 指令通道）→ 恢复广播，iPhone 通常 1~3 s 自动连回来；没连回来就让用户到 iPhone 设置→蓝牙 点一下 HIL-Bridge。
- *   上电时正常广播。空闲且 Mac 也没连着时板子对外没有广播，新起的守护进程连不上：给板子断电重启（或按 EN 键）即可。
+ * HID 空闲（0.3.0 起，0.3.3 定型）：iOS 只要连着一个蓝牙键盘就把所有 App 的屏幕键盘藏起来，所以板子不能常年挂在 iPhone 上。
+ *   hididle 秒（默认 600）没有需要 HID 的命令 → 断开 iPhone（不清绑定）。板子【始终在广播】，不会把自己变成不可达。
+ *   parkadv=1（默认）：空闲时照样以蓝牙键盘身份广播，iPhone 随时能在 设置→蓝牙 点它连回来（连回来就算醒来）；
+ *     代价：iOS 对已配对键盘回连很积极，连着时屏幕键盘照样被藏——实测「板子能操作」和「屏幕键盘能用」在 iOS 上互斥。
+ *   parkadv=0：空闲时只播指令服务，iOS 不把它当键盘、不回连，屏幕键盘稳定可用；要用时得 WAKE 后让用户手工点。
  *
  * 后端：
  *   HID_BACKEND=1  BLE HID（默认，推荐：iPhone 的 USB 口留给 Mac 录屏）。命令走 Serial（板子的 USB 口，Hardware CDC）。
@@ -38,7 +39,7 @@
 #define BACKEND_NAME "usb"
 #endif
 
-#define FW_VERSION "0.3.2"
+#define FW_VERSION "0.3.3"
 #define DEFAULT_NAME "HIL-Bridge"
 #define BAUD 115200
 
@@ -50,8 +51,11 @@ struct Config {
   uint16_t appearance; // BLE 外观：0x03C2 鼠标 / 0x03C1 键盘 / 0x03C0 通用 HID
   char token[17];      // BLE 指令通道的口令（Mac 连上后要先 AUTH <token>）
   char hidpeer[20];    // 允许接收 HID 报告的对端地址（第一次订阅时自动记住 = iPhone），防止 Mac 接管
-  uint16_t hididle;    // 空闲多少秒后主动断开 iPhone 的 HID 连接（0 = 永不，即一直连着）。
+  uint16_t hididle;    // 空闲多少秒后主动断开 iPhone 的 HID 连接（0 = 永不，即一直连着）。默认 600（和 Mac 守护进程 10 分钟自动退出对齐）。
                        // 为什么：iOS 只要连着一个蓝牙键盘就把所有 App 的屏幕键盘藏起来；板子常年通电 = 手机永远弹不出键盘。
+  uint8_t parkadv;     // 空闲(parked)时怎么广播：1=照样以 HID 身份广播并接受 iPhone 自己连回来【默认，随时能连】（连着时屏幕键盘被 iOS 藏起来）；
+                       // 0=只播指令服务(NUS)，iOS 不把它当键盘来自动重连 → 屏幕键盘稳定可用，但要用板子得 WAKE 后手工点。
+                       // 实测：iOS 对已配对的 HID 键盘会很积极地自动重连并占住，所以“一直以 HID 广播”和“空闲放开键盘”本质冲突，这个开关让用户二选一。
 } cfg;
 Preferences prefs;
 
@@ -62,8 +66,9 @@ static void loadConfig() {
   cfg.name[sizeof(cfg.name) - 1] = 0;
   cfg.mvdelay = prefs.getUShort("mvdelay", 25);  // ≥ BLE 连接间隔，报告才不会在协议栈里排队（实测 8 会排队）
   cfg.typedelay = prefs.getUShort("typedelay", 12);
-  cfg.appearance = prefs.getUShort("appear", 0);  // 0 = 通用外观（见 hidBegin 里的说明）
-  cfg.hididle = prefs.getUShort("hididle", 120);
+  cfg.appearance = prefs.getUShort("appear", 0x3C2);  // 0x3C2 = HID 鼠标外观：iOS 才在 设置→蓝牙 里列出它（见 updateAdvertising 的说明）
+  cfg.hididle = prefs.getUShort("hididle", 600);
+  cfg.parkadv = (uint8_t)prefs.getUShort("parkadv", 1);   // 默认 1：空闲时照样以键盘身份广播，iPhone 随时能连回来
   String t = prefs.getString("token", "");
   prefs.end();
   if (t.length() < 4) {  // 第一次启动：随机生成口令并存下来
@@ -87,6 +92,7 @@ static void saveConfig() {
   prefs.putString("token", cfg.token);
   prefs.putString("hidpeer", cfg.hidpeer);
   prefs.putUShort("hididle", cfg.hididle);
+  prefs.putUShort("parkadv", cfg.parkadv);
   prefs.end();
 }
 
@@ -100,8 +106,9 @@ static volatile bool g_evt_conn = false, g_evt_disc = false;  // 回调里置位
 static uint32_t g_txfail = 0;  // notify() 返回 false 的次数（排队满/未订阅）
 
 // ---- HID 空闲/唤醒（只对 BLE 后端有意义）----
-// 空闲：断开 iPhone，并停止广播，直到被 WAKE / 需要 HID 的命令唤醒。醒着（有活动）：正常广播，iPhone 按绑定自动连回来。
-static bool g_hidAwake = true;
+// 空闲(parked)：断开 iPhone 的 HID 连接让键盘恢复，但板子【始终以 HID 身份广播】——iPhone 随时能自己在 设置→蓝牙 点一下连回来。
+// 醒着（有活动）：iPhone 连着就当 HID 目标用。
+static bool g_hidAwake = false;         // 上电默认 parked；parkadv=1 时 iPhone 一连上来就醒，parkadv=0 时等 WAKE / 有命令
 static uint32_t g_lastActMs = 0;        // 最近一次活动（需要 HID 的命令 / WAKE）
 static volatile bool g_evt_adv = false; // 连接数变了 / 状态变了：loop() 里重新决定广播（回调里不碰广播，避免两个任务抢）
 static volatile bool g_evt_idle = false, g_evt_wake = false;
@@ -166,26 +173,39 @@ static uint32_t g_bleRxLines = 0, g_bleTxReplies = 0, g_bleWrites = 0;  // 对�
 
 static const char* g_advMode = "off";   // 当前广播：pub / off（满了，或空闲中）
 
-static bool hidAlwaysOn() { return cfg.hididle == 0 || cfg.appearance != 0; }  // appearance≠0 = 正在给新 iPhone 配对，别睡
+static bool hidAlwaysOn() { return cfg.hididle == 0; }  // 只有 hididle=0 才一直连着；appearance 不再影响是否 parked
 
-// 按当前状态决定广播。只在 loop() 任务里调用。
+// 按当前状态决定广播，并每次都按当前 cfg 重建广播内容。只在 loop() 任务里调用。
 static void updateAdvertising() {
   if (!g_server) return;
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->stop();
+  // 醒着(awake)或 parkadv=1（默认）：带 HID 服务 UUID(0x1812) 广播——iOS 认出它是“已配对的键盘”，在 设置→蓝牙 里显示可连、能自己重连。
+  // parked 且 parkadv=0：只播指令服务(NUS)——iOS 不把它当键盘，于是不会自动重连来抢键盘，屏幕键盘稳定可用。
+  //   板子【始终在广播】（HID 或 NUS），永远可被 Mac/用户连上，绝不把自己变成不可达。Mac 守护进程按【名字】扫描匹配，
+  //   不靠广播里的服务 UUID，所以 parked 播 NUS 时 Mac 照样连得上、发 WAKE 就把广播切回 HID、iPhone 几秒内重连。
+  // appearance 默认 0x3C2：iOS 要靠它才在 设置→蓝牙 里列出板子（0 时连已配对的也常看不到）。代价是 macOS 用系统蓝牙连它时
+  //   可能想自动配对接管——hidpeer 之外来订阅 HID 的在 onSubscribe 里直接踢掉；Mac 别在系统设置里配对它。
+  bool parked = !g_hidAwake && !hidAlwaysOn();
+  bool advHid = !parked || cfg.parkadv;
+  adv->clearData();
+  adv->setName(cfg.name);
+  if (advHid) { adv->addServiceUUID(g_hid->getHidService()->getUUID()); if (cfg.appearance) adv->setAppearance(cfg.appearance); }
+  else adv->addServiceUUID(NUS_SERVICE);
+  adv->enableScanResponse(true);
   int n = g_server->getConnectedCount();
   bool ok = false;
   if (n >= 2) { g_advMode = "off"; }       // iPhone + Mac 都在，满了
   else { ok = adv->start(); g_advMode = "pub"; }   // 其余情况一直广播：板子始终可被 Mac/用户连上，绝不把自己变成不可达
-  CMD_SERIAL.printf("# adv %s ok=%d conns=%d\n", g_advMode, ok ? 1 : 0, n);
+  CMD_SERIAL.printf("# adv %s ok=%d conns=%d hid=%d appear=0x%x\n", g_advMode, ok ? 1 : 0, n, advHid ? 1 : 0, cfg.appearance);
 }
-static void hidGoIdle() {   // 空闲：断开 iPhone 的 HID（键盘恢复），但板子继续广播、保留绑定
+static void hidGoIdle() {   // 空闲：断开 iPhone 的 HID（键盘恢复）；广播切到 parkadv 指定的模式（1=照样 HID，0=只播 NUS）
   if (!g_hidAwake) return;
   g_hidAwake = false; g_evt_idle = true;
   if (g_hidConn != BLE_HS_CONN_HANDLE_NONE) g_server->disconnect(g_hidConn);   // 只断这条连接；onDisconnect 会清状态
   g_evt_adv = true;
 }
-static void hidWake() {   // 取消空闲、重置计时：下次 iPhone 连上来就接受（parked 时会被 loop 踢掉，这里解除）
+static void hidWake() {   // 取消空闲、重置计时，并把广播切回 HID（iPhone 还绑着时多半自己连回来，否则要用户在设置里点）
   g_lastActMs = millis();
   if (g_hidAwake) return;
   g_hidAwake = true; g_evt_wake = true; g_evt_adv = true;
@@ -197,11 +217,19 @@ class MouseReportCB : public NimBLECharacteristicCallbacks {
     std::string addr = ci.getIdAddress().toString();
     qlog("# sub h=%d id=%s v=%d", ci.getConnHandle(), addr.c_str(), subValue);
     if (subValue & 1) {
-      if (cfg.hidpeer[0] == 0) { strncpy(cfg.hidpeer, addr.c_str(), sizeof(cfg.hidpeer) - 1); saveConfig(); }  // 第一次：记住它
-      if (strcasecmp(addr.c_str(), cfg.hidpeer) != 0) return;  // 不是记住的那台（比如 Mac 自己来配对）：不当 HID 目标
+      if (cfg.hidpeer[0] == 0) { strncpy(cfg.hidpeer, addr.c_str(), sizeof(cfg.hidpeer) - 1); cfg.hidpeer[sizeof(cfg.hidpeer) - 1] = 0; saveConfig(); }  // 第一次：记住它（= iPhone）
+      if (strcasecmp(addr.c_str(), cfg.hidpeer) != 0) {   // 不是记住的那台（比如 macOS 看到 HID 想自动接管）：直接断开，别让它占着
+        qlog("# kick non-hidpeer HID subscriber id=%s", addr.c_str());
+        g_dropHidConn = ci.getConnHandle(); g_evt_dropHid = true; return;
+      }
       g_hidConn = ci.getConnHandle(); g_ready = true; g_evt_conn = true;
-      // parked（空闲中）时 iPhone 自己连回来：不接受，交给 loop() 断开——不然键盘又被藏。要用它得先 WAKE/发命令。
-      if (!g_hidAwake && !hidAlwaysOn()) { g_dropHidConn = ci.getConnHandle(); g_evt_dropHid = true; }
+      // parked（空闲中）时 iPhone 自己连回来怎么办，看 parkadv：
+      //   parkadv=1（默认，随时连）：接受并唤醒，hididle 秒没命令再踢（代价是连着时屏幕键盘被藏）。
+      //   parkadv=0（键盘优先）：踢掉——否则 iOS 一重连键盘又被藏。要用板子得先让它醒来（Mac/skill 发 WAKE 或发命令）。
+      if (!g_hidAwake && !hidAlwaysOn()) {
+        if (cfg.parkadv) { g_hidAwake = true; g_lastActMs = millis(); g_evt_wake = true; g_evt_adv = true; }
+        else { g_dropHidConn = ci.getConnHandle(); g_evt_dropHid = true; }
+      }
     } else if (ci.getConnHandle() == g_hidConn) { g_hidConn = BLE_HS_CONN_HANDLE_NONE; g_ready = false; }
   }
 };
@@ -279,13 +307,8 @@ static void hidBegin() {
   g_nusRx->setCallbacks(new NusRxCB());
   g_nusTx = nus->createCharacteristic(NUS_TX, NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ);
   g_server->start();
-  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-  if (cfg.appearance) adv->setAppearance(cfg.appearance);   // 默认 0：不声明 HID 外观，macOS 就不会自作主张来配对
-  if (cfg.appearance) adv->addServiceUUID(g_hid->getHidService()->getUUID());  // 第一次给 iPhone 配对时可临时 CFG appearance 0x3C2
-  else adv->addServiceUUID(NUS_SERVICE);
-  adv->setName(cfg.name);
-  adv->enableScanResponse(true);
-  g_hidAwake = true; g_lastActMs = millis();   // 上电正常广播：若 iPhone 还在找它（上次是断电/链路丢失）会连上，hididle 后再断
+  // 广播内容由 updateAdvertising() 按当前 cfg + 醒/睡状态构建，改配置或醒睡切换都不必重启。
+  g_hidAwake = false; g_lastActMs = millis();   // 上电 parked：按 parkadv 广播（默认 HID，iPhone 还绑着会 ~1 s 自己连回来并唤醒）
   updateAdvertising();
 }
 static inline bool hidReady() { return g_ready; }
@@ -521,19 +544,19 @@ static void handleLine(char* line) {
 #endif
 #if HID_BACKEND == 1
     if (g_sink == SINK_BLE) {
-      replyf("OK conn=%d hid=%s hididle=%u idle=%lu conns=%d adv=%s backend=%s name=%s mvdelay=%u typedelay=%u txfail=%lu fw=%s via=ble hidpeer=%s blew=%lu bler=%lu blet=%lu", hidReady() ? 1 : 0, hidStateStr(), cfg.hididle, idleS, conns, advm, BACKEND_NAME, cfg.name, cfg.mvdelay, cfg.typedelay, (unsigned long)g_txfail, FW_VERSION, cfg.hidpeer[0] ? cfg.hidpeer : "-", (unsigned long)g_bleWrites, (unsigned long)g_bleRxLines, (unsigned long)g_bleTxReplies);
+      replyf("OK conn=%d hid=%s hididle=%u parkadv=%u idle=%lu conns=%d adv=%s appear=0x%x backend=%s name=%s mvdelay=%u typedelay=%u txfail=%lu fw=%s via=ble hidpeer=%s blew=%lu bler=%lu blet=%lu", hidReady() ? 1 : 0, hidStateStr(), cfg.hididle, (unsigned)cfg.parkadv, idleS, conns, advm, cfg.appearance, BACKEND_NAME, cfg.name, cfg.mvdelay, cfg.typedelay, (unsigned long)g_txfail, FW_VERSION, cfg.hidpeer[0] ? cfg.hidpeer : "-", (unsigned long)g_bleWrites, (unsigned long)g_bleRxLines, (unsigned long)g_bleTxReplies);
       return;
     }
 #endif
-    replyf("OK conn=%d hid=%s hididle=%u idle=%lu conns=%d adv=%s backend=%s name=%s mvdelay=%u typedelay=%u txfail=%lu fw=%s via=serial hidpeer=%s token=%s", hidReady() ? 1 : 0, hidStateStr(), cfg.hididle, idleS, conns, advm, BACKEND_NAME, cfg.name, cfg.mvdelay, cfg.typedelay, (unsigned long)g_txfail, FW_VERSION, cfg.hidpeer[0] ? cfg.hidpeer : "-", cfg.token);
+    replyf("OK conn=%d hid=%s hididle=%u parkadv=%u idle=%lu conns=%d adv=%s appear=0x%x backend=%s name=%s mvdelay=%u typedelay=%u txfail=%lu fw=%s via=serial hidpeer=%s token=%s", hidReady() ? 1 : 0, hidStateStr(), cfg.hididle, (unsigned)cfg.parkadv, idleS, conns, advm, cfg.appearance, BACKEND_NAME, cfg.name, cfg.mvdelay, cfg.typedelay, (unsigned long)g_txfail, FW_VERSION, cfg.hidpeer[0] ? cfg.hidpeer : "-", cfg.token);
     return;
   }
-  if (strieq(cmd, "WAKE")) {    // 让板子向 iPhone 广播（iPhone 按绑定自动重连），并重置空闲计时；conn=1 表示已经连着
+  if (strieq(cmd, "WAKE")) {    // 退出空闲、以 HID 广播并重置空闲计时；conn=1 表示已经连着（没连着时 iPhone 不一定自己回连）
     hidWake(); replyf("OK wake conn=%d hid=%s", hidReady() ? 1 : 0, hidStateStr()); return;
   }
   if (strieq(cmd, "RESTART")) { reply("OK restart"); CMD_SERIAL.flush(); delay(50); esp_restart(); }   // 硬复位（等于断电重启，绑定/配置都在）
-  if (strieq(cmd, "SLEEP")) {   // 立刻断开 iPhone 的 HID 连接并停止广播（屏幕键盘马上恢复）；hididle=0 时无效
-    if (hidAlwaysOn()) { reply("ERR hididle=0 or pairing mode (appearance!=0)"); return; }
+  if (strieq(cmd, "SLEEP")) {   // 立刻断开 iPhone 的 HID 连接（屏幕键盘马上恢复），广播按 parkadv；hididle=0 时无效
+    if (hidAlwaysOn()) { reply("ERR hididle=0 (always on)"); return; }
     hidGoIdle(); reply("OK sleep"); return;
   }
   if (strieq(cmd, "CFG")) {
@@ -542,6 +565,7 @@ static void handleLine(char* line) {
     else if (strieq(a1, "typedelay")) cfg.typedelay = atoi(a2);
     else if (strieq(a1, "appearance")) cfg.appearance = (uint16_t)strtol(a2, nullptr, 0);
     else if (strieq(a1, "hididle")) cfg.hididle = (uint16_t)atoi(a2);
+    else if (strieq(a1, "parkadv")) cfg.parkadv = (uint8_t)atoi(a2);
     else if (strieq(a1, "name")) { strncpy(cfg.name, a2, sizeof(cfg.name) - 1); cfg.name[sizeof(cfg.name) - 1] = 0; }
     else if (strieq(a1, "token")) { if (g_sink != SINK_SERIAL) { reply("ERR token only via serial"); return; } strncpy(cfg.token, a2, sizeof(cfg.token) - 1); cfg.token[sizeof(cfg.token) - 1] = 0; }
     else if (strieq(a1, "hidpeer")) { if (strieq(a2, "clear")) cfg.hidpeer[0] = 0; else { strncpy(cfg.hidpeer, a2, sizeof(cfg.hidpeer) - 1); cfg.hidpeer[sizeof(cfg.hidpeer) - 1] = 0; } }
@@ -558,12 +582,13 @@ static void handleLine(char* line) {
     else { replyf("ERR unknown cfg %s", a1); return; }
     saveConfig();
     if (strieq(a1, "hididle")) { if (hidAlwaysOn()) hidWake(); else g_evt_adv = true; }   // 改成 0 立刻恢复常连；否则按新时限计
-    replyf("OK cfg %s%s", a1, (strieq(a1, "name") || strieq(a1, "appearance")) ? " (reboot to apply)" : "");
+    if (strieq(a1, "appearance") || strieq(a1, "name") || strieq(a1, "parkadv")) g_evt_adv = true;   // 立刻按新 cfg 重建广播，不必重启
+    replyf("OK cfg %s%s", a1, strieq(a1, "name") ? " (adv applied live; reboot for GAP name)" : "");
     return;
   }
   if (strieq(cmd, "RL")) { releaseAll(); reply("OK rl"); return; }
   // 往下都是需要 iPhone 连着的命令：算一次活动（重置空闲计时），空闲中就先唤醒（开始向 iPhone 广播）。
-  // iPhone 连回来要 1~3 s，这期间回 ERR not connected，Mac 端守护进程会等 conn=1 再重发。
+  // iPhone 连回来要 1~3 s（若它肯回连），这期间回 ERR not connected，Mac 端守护进程会等 conn=1 再重发。
   hidWake();
   if (!hidReady()) { reply("ERR not connected"); return; }
 
@@ -666,7 +691,7 @@ void loop() {
   while (g_logQueue && xQueueReceive(g_logQueue, &lm, 0) == pdTRUE) CMD_SERIAL.println(lm.s);
   BleMsg m;
   while (g_bleQueue && xQueueReceive(g_bleQueue, &m, 0) == pdTRUE) handleBleLine(m.conn, m.line);
-  // 空闲计时：醒着且超过 hididle 秒没活动 → 断开 iPhone（键盘恢复），板子继续广播
+  // 空闲计时：醒着且超过 hididle 秒没活动 → 断开 iPhone（键盘恢复），广播切到 parkadv 指定的模式
   if (!hidAlwaysOn() && g_hidAwake && (uint32_t)(millis() - g_lastActMs) > (uint32_t)cfg.hididle * 1000UL) hidGoIdle();
   if (g_evt_dropHid) { g_evt_dropHid = false; if (g_dropHidConn != BLE_HS_CONN_HANDLE_NONE) { g_server->disconnect(g_dropHidConn); g_dropHidConn = BLE_HS_CONN_HANDLE_NONE; } }
   if (g_evt_adv) { g_evt_adv = false; updateAdvertising(); }

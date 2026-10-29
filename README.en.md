@@ -28,14 +28,17 @@ ten taps in total, none missed, not a single character typed.
 > iOS hides the on-screen keyboard in every app whenever **any Bluetooth keyboard** is connected — and to the phone the board *is* a Bluetooth
 > keyboard. So a board that stays connected leaves you unable to type on your own phone. This project deliberately does **not** keep it connected.
 >
-> **2. The board "sleeps" and releases the phone, so the keyboard comes back.**
-> When you're not using the tool the board is in normal mode; after **120 s** with no input command it drops its Bluetooth connection to the iPhone
-> and your on-screen keyboard **returns immediately**. To release it right away: `hil stop` or `hil normal`. It's just a BLE peripheral — leave it on a charger.
+> **2. The board releases the phone when idle — but by default the iPhone reconnects right away.**
+> After **600 s** with no input command the board drops the iPhone. With the default `parkadv=1`, though, the board keeps advertising as a
+> keyboard and the iPhone reconnects within 0.3 s, so your on-screen keyboard **stays mostly hidden**. This is a hard iOS trade-off:
+> "the board can always operate the phone (auto-reconnect)" and "the on-screen keyboard is free" are mutually exclusive.
+> To get the keyboard back: `hil send 'CFG parkadv 0'` then `hil normal` (the board drops the iPhone and refuses its reconnects), or power
+> the board off, or turn Bluetooth off on the iPhone. iOS Bluetooth settings have **no "Disconnect"** — only "Forget This Device" (don't).
 >
-> **3. Each time you want to use it, you connect Bluetooth by hand (iOS won't let a peripheral reconnect itself).**
-> This is a hard iOS constraint: the phone (central) decides what to connect to; the board (peripheral) cannot pull the phone back, and software can't
-> force it. So when you start a session the tool (`hil up`) puts the board into a connectable state and prompts you: on the iPhone, go to
-> **Settings → Bluetooth** and tap the device named **`HIL-Bridge`**. Once connected it stays connected for the session; run `hil stop` when done.
+> **3. If it won't connect, tap HIL-Bridge in the iPhone's Settings → Bluetooth.**
+> With the defaults the iPhone reconnects by itself after a board reboot or an idle drop, so `hil up` usually just reports "connected".
+> But iOS doesn't reconnect Bluetooth keyboards while the phone is locked, and after `parkadv=0` it stops reconnecting on its own — then
+> `hil up` prompts you to tap it by hand.
 
 ---
 
@@ -185,9 +188,10 @@ The firmware `firmware/hid_bridge/hid_bridge.ino` does three things:
 3. **Two simultaneous connections**: one for the iPhone (HID, bonded, locked to its address) and one for the Mac (commands, unpaired, token-protected). It keeps advertising until both slots are filled.
 
 So the ESP32 normally just sits on a USB charger. The Mac talks to it through CoreBluetooth (`hil/ble_central.py`) without pairing in
-System Settings—and it must **not** be paired there, or macOS will claim it as its own mouse and keyboard. To that end the firmware
-advertises a generic appearance (0) rather than a HID appearance and locks its HID target to the first device that subscribes to mouse
-reports (the iPhone).
+System Settings—and it must **not** be paired there, or macOS will claim it as its own mouse and keyboard. The firmware locks its HID target
+to the first device that subscribes to mouse reports (the iPhone) and drops any other HID subscriber. (Firmware 0.3.3 advertises the HID
+appearance `0x3C2` by default — without it the iPhone doesn't list the board in Settings. Side effect: about 30 s after the Mac's link daemon
+connects, macOS tries to auto-pair, fails and times out, and the command channel stalls briefly; `hil up` waits it out.)
 
 Serial (a USB cable to the board) remains available for flashing, reading the token and changing configuration.
 
@@ -236,21 +240,22 @@ it, and capture and Bluetooth are each ready in about 2 s. The capture service c
 commands; polling status does not keep them alive. They are tiny (about 30 MB RAM combined, near-zero CPU); the auto-quit mainly saves
 the iPhone's battery, because while capture runs the phone is continuously mirroring its display.
 
-The board idles too (firmware 0.3.2+): **after 120 s without an input command it drops the iPhone's HID connection so the phone's
-keyboard works again**. iOS hides the on-screen keyboard in every app while any Bluetooth keyboard is connected, so a board that stays
-connected around the clock leaves the user unable to type on their own phone.
+The board idles too (firmware 0.3.3): **after 600 s without an input command it drops the iPhone's HID connection** so the phone's
+keyboard can work again — iOS hides the on-screen keyboard in every app while any Bluetooth keyboard is connected.
 
-**Connecting is "software opens listening, you tap by hand" (important).** On iOS the iPhone (central) decides what to connect to; the
-board (peripheral) cannot force it, and once the board drops the iPhone, iOS enters a reconnection back-off and **no amount of advertising
-brings it back from software** (see `docs/IOS_RECONNECT_HANDOFF.md` for the measurements and the underlying constraint). The only reliable
-way is for the board to **advertise as a Bluetooth keyboard** (firmware `appearance=0x3C2`, versus the `appearance=0` it uses normally to
-keep macOS from claiming it) so the iPhone sees it in Settings → Bluetooth and **you tap HIL-Bridge by hand** to connect.
+**Whether the keyboard really comes back depends on `parkadv`** (on iOS the iPhone decides what to connect to; the board cannot choose when
+it comes back):
+- `parkadv=1` (default, "always connectable"): the board always advertises as a Bluetooth keyboard (`appearance=0x3C2`); the iPhone
+  reconnects 0.3 s after an idle drop and within 1 s of a board reboot. The tool is always usable; the cost is that the on-screen keyboard
+  stays mostly hidden.
+- `parkadv=0` ("keyboard first"): once idle the board advertises only the command service and drops any reconnect; iOS gives up after
+  about 6 s and the on-screen keyboard is stable. The cost: software (`WAKE`) can no longer bring the iPhone back, so each session starts
+  with a manual tap on HIL-Bridge in Settings → Bluetooth.
 
-So the workflow is: normally the board is in normal mode (`appearance=0`, drops the iPhone on idle to free the keyboard) → to use the tool,
-`hil up` (when the iPhone is not connected) or `hil listen` switches it to listening mode and prompts, and you tap HIL-Bridge → once
-connected, listening mode does not drop it mid-session → when done, `hil normal` / `hil stop` (or the services quitting after 10 idle
-minutes) switches back to normal mode, releases the iPhone, and the on-screen keyboard returns. Change the idle limit over serial with
-`CFG hididle <seconds>`; see `firmware/FLASH.md`.
+Measured on a real device, these are mutually exclusive. Workflow: `hil up` starts the services and sends `WAKE`; if the iPhone is
+connected you go, otherwise it prompts you to tap it. `hil normal` / `hil stop` (or the services quitting after 10 idle minutes) send
+`SLEEP` — with parkadv=1 the iPhone reconnects right away, and `hil normal` says so and tells you how to free the keyboard.
+Change `hididle` / `parkadv` with `hil send 'CFG …'`; it takes effect immediately (see `firmware/FLASH.md`).
 
 ---
 
@@ -374,7 +379,9 @@ python -m hil type "ascii"         # ASCII text (make sure the English keyboard 
 python -m hil key GUI+H            # key combos; GUI+SPACE opens Spotlight
 python -m hil home                 # Home
 python -m hil goto X Y             # move the pointer without clicking (so wheel events land on a list)
-python -m hil status / up / stop   # both services + firmware state / start / stop now
+python -m hil listen               # WAKE and wait for the iPhone; prompts a manual tap if it doesn't come back
+python -m hil normal               # SLEEP: release the iPhone; with parkadv=1 it reconnects, and it tells you how to free the keyboard
+python -m hil status / up / stop   # both services + firmware state / start and wait for the iPhone / stop now (SLEEP on exit)
 python -m hil run script.txt       # one action per line through the Runner (frame + log.jsonl per step)
 python -m hil step                 # interactive: a human is the brain
 ```
@@ -426,7 +433,7 @@ The services quit on their own after 10 idle minutes.
 
 ## 11. Known limitations and to-do
 
-- **While the board is connected you can't bring up the phone's on-screen keyboard, and connecting is a manual Bluetooth tap.** See "Three things to know before you use it" at the top: iOS hides every on-screen keyboard while a Bluetooth keyboard is connected, so leave the board asleep/released when not in use (auto-releases after 120 s idle, or `hil stop`); each time you want to use it, tap `HIL-Bridge` by hand in Settings → Bluetooth on the iPhone (iOS won't let a peripheral reconnect itself — this part cannot be automated; see `docs/IOS_RECONNECT_HANDOFF.md`).
+- **While the board is connected you can't bring up the phone's on-screen keyboard; "always operable" and "keyboard free" are mutually exclusive.** See "Three things to know before you use it" at the top. With the default `parkadv=1` the board drops the iPhone after 600 s idle but it reconnects right away; `parkadv=0` really frees the keyboard, but then each session needs a manual tap on `HIL-Bridge` in Settings → Bluetooth (a peripheral can't make the iPhone connect; see the "空闲时放开 iPhone" section of `firmware/FLASH.md`).
 - **Chinese input goes through Universal Clipboard: slow but workable.** A Bluetooth keyboard only sends ASCII; for anything else use `paste`: Mac `pbcopy` → Universal Clipboard → `⌘V` on the iPhone, with Handoff enabled on both devices. Measured behaviour: the iPhone only fetches the Mac's clipboard when it receives `⌘V`, and only if it has already seen the Mac's Bluetooth advertisement. Pasting 2 s after the copy often does nothing at all; 4–5 s is reliable; a copy on the Mac expires after 2 minutes. So `paste` always copies fresh, waits 5 s by default, and the caller must confirm with a screenshot, re-sending `⌘V` once after 3 s if nothing appeared. Prefer lists, index bars and menus over typing whenever possible.
 - **Negative wheel direction has no effect** (cannot scroll up; cause unknown). Use `drag` or arrow keys to go up.
 - The Chinese Pinyin keyboard swallows letters into pinyin composition and treats digits as candidate selectors; switch to the English keyboard before `type` (`key CTRL+SPACE` cycles; confirm with a screenshot).
@@ -446,7 +453,7 @@ The services quit on their own after 10 idle minutes.
 - **The main thread must pump an NSRunLoop**, or AVFoundation's device hot-plug notifications are never delivered and a resident service never sees an iPhone plugged in later.
 - **CH340 boards reset every time the serial port is opened**, so the daemon opens it once and the CLI relays over HTTP.
 - **BLE reports queue up in the stack.** The firmware splits large moves into ±127 reports; the gap between reports must be ≥ the connection interval (25 ms measured), otherwise dozens of reports pile up, every frame shows a stale position and calibration produces garbage.
-- **macOS auto-claims BLE devices with a HID appearance.** As soon as the Mac connects to a peripheral advertising HID, bluetoothd initiates pairing on its own and registers it as a mouse. Countermeasures: advertise a generic appearance, advertise the custom service UUID instead of the HID UUID, and lock the HID target to one address in firmware.
+- **macOS auto-claims BLE devices with a HID appearance.** As soon as the Mac connects to a peripheral advertising HID, bluetoothd initiates pairing on its own and registers it as a mouse. Countermeasures: lock the HID target to one address in firmware and kick any other HID subscriber; never pair the board in macOS System Settings. Since firmware 0.3.3 the board advertises a HID appearance by default (the iPhone needs it), so macOS still attempts a pairing ~30 s after the daemon connects; it fails and the command channel stalls briefly.
 - **A full-chip flash erases NVS**, which holds the iPhone bond keys and configuration; upgrades flash only the app partition.
 - **Bluetooth turns off and on when the Mac sleeps**; the connection is dead but the object survives. The central marks itself disconnected as soon as the state leaves PoweredOn and the main loop reconnects.
 - **The iOS pointer is a ring, not a disk**: sample saturated pixels on the ring and fill the outer contour before judging roundness.

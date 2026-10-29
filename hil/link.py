@@ -196,67 +196,31 @@ class SerialLink(Link):
 
 
 # ---------------------------------------------------------------------------
-# 广播模式切换（经串口，独立于 BLE 守护进程）
+# 让 iPhone 连上（固件 ≥0.3.3）
 # ---------------------------------------------------------------------------
-# 背景：固件默认 appearance=0 时只广播命令服务、不以蓝牙键盘身份广播（防 macOS 自动把板子
-# 当键鼠抢走）。这样 iPhone 在设置→蓝牙里看不到它，被板子踢掉后也连不回来。
-# appearance=0x3C2（侦听/配对模式）才广播 HID 身份，iPhone 才能在设置里手工点着连上。
-# appearance 改了要重启才生效（广播数据在 setup 里一次性设好）。改模式不碰 BLE 守护进程：
-# 守护进程按名字 HIL-Bridge 广扫、命令服务一直都在，重启后它会自己按名字重连。
-def set_adv_mode(listen: bool, port: Optional[str] = None, settle: float = 3.5,
-                 log: Optional[Callable[[str], None]] = None) -> dict:
-    """经串口把板子切到侦听模式(listen=True, 以蓝牙键盘身份广播, iPhone 可手工连)
-    或正常模式(False, 不广播 HID 身份, 空闲会自动踢 iPhone 让屏幕键盘恢复)，并重启生效。
-    返回重启后的 ST 字段。"""
-    sl = SerialLink(port=port, log=log)
-    try:
-        sl.send(f"CFG appearance {'0x3C2' if listen else '0'}")
-        sl.ser.write(b"RESTART\n"); sl.ser.flush()
-        time.sleep(settle)
-        sl.ser.reset_input_buffer()
-        last = None
-        st = None
-        for _ in range(6):   # 重启后等它起来
-            try:
-                st = sl.status(); break
-            except Exception as e:
-                last = e; time.sleep(0.8)
-        if st is None:
-            raise LinkError(f"切模式后板子没回应: {last}")
-        if not listen:   # 回正常模式：立刻 park 一下，iPhone 松开、屏幕键盘马上恢复（不用等 hididle）
-            try:
-                sl.send("SLEEP")
-            except Exception:
-                pass
-        return st
-    finally:
-        sl.close()
-
-
-def listen_and_wait(port: Optional[str] = None, wait_s: float = 60.0,
-                    prompt: Optional[Callable[[], None]] = None,
-                    log: Optional[Callable[[str], None]] = None) -> dict:
-    """把板子切到侦听模式，提示用户去 iPhone 设置→蓝牙手工点 HIL-Bridge，然后轮询直到 conn=1 或超时。
-    返回最后一次 ST（含 conn 字段）。全程走串口，不依赖 BLE 守护进程。"""
-    st = set_adv_mode(True, port=port, log=log)
-    if st.get("conn") == "1":
-        return st
-    if prompt:
-        prompt()
-    sl = SerialLink(port=port, log=log)
-    try:
-        t0 = time.time()
-        while time.time() - t0 < wait_s:
-            try:
-                st = sl.status()
-                if st.get("conn") == "1":
-                    return st
-            except Exception:
-                pass
-            time.sleep(2.0)
-        return st
-    finally:
-        sl.close()
+# 板子（appearance=0x3C2、parkadv=1）始终以蓝牙键盘身份广播，iPhone 在 设置→蓝牙 里一直看得到它、
+# 板子重启后 iPhone ~1 s 自动连回。被空闲踢开后 iOS 不一定马上回连，这时只能让用户在 设置→蓝牙 点一下。
+# 所以这里只做：WAKE（重置空闲计时、广播 HID）→ 轮询 ST 等 conn=1 → 过一会儿还没连上就提示用户去点。
+# 不再改 appearance、不再 RESTART（那是 0.3.2 的「侦听/正常模式」做法，已删）。
+def wait_iphone(link: "Link", wait_s: float = 60.0, prompt: Optional[Callable[[], None]] = None,
+                prompt_after: float = 4.0) -> dict:
+    """WAKE 后等 iPhone 的 HID 连上，返回最后一次 ST 字段（conn="1" 表示连上了）。
+    prompt_after 秒后还没连上就调用一次 prompt（提示用户去 iPhone 设置→蓝牙 点 HIL-Bridge）。"""
+    r = link.send("WAKE")
+    if r.ok and r.fields.get("conn") == "1":
+        return link.status()
+    t0, prompted, st = time.time(), False, {}
+    while time.time() - t0 < wait_s:
+        try:
+            st = link.status()
+            if st.get("conn") == "1":
+                return st
+        except Exception:
+            pass
+        if prompt and not prompted and time.time() - t0 >= prompt_after:
+            prompt(); prompted = True
+        time.sleep(1.0)
+    return st
 
 
 # ---------------------------------------------------------------------------
@@ -268,9 +232,9 @@ class FirmwareModel:
     def __init__(self, hid=None, backend: str = "ble", name: str = "HIL Bridge"):
         self.hid = hid
         self.backend, self.name = backend, name
-        self.cfg = {"mvdelay": 25, "typedelay": 12, "hididle": 120}
+        self.cfg = {"mvdelay": 25, "typedelay": 12, "hididle": 600, "parkadv": 1, "appearance": 0x3C2}
         self.mods, self.keys, self.buttons = 0, [], 0
-        self.hid_awake = True   # 固件 0.3.0：空闲时主动断开 iPhone；桩里只记状态
+        self.hid_awake = True   # 固件 ≥0.3.0：空闲时主动断开 iPhone；桩里只记状态
         self.sleep = (lambda ms: None)  # 回环时不真等；想真实节奏可换成 time.sleep
 
     # --- HID 报告出口 ---
@@ -300,14 +264,14 @@ class FirmwareModel:
             if cmd == "ST":
                 conn = 1 if (self.hid is None or getattr(self.hid, "connected", True)) else 0
                 hid = "on" if conn else ("waking" if self.hid_awake else "idle")
-                return f"OK conn={conn} hid={hid} hididle={self.cfg['hididle']} idle=0 backend={self.backend} name={self.name} mvdelay={self.cfg['mvdelay']} typedelay={self.cfg['typedelay']} txfail=0"
+                return f"OK conn={conn} hid={hid} hididle={self.cfg['hididle']} parkadv={self.cfg['parkadv']} idle=0 conns={conn} adv=pub appear=0x{self.cfg['appearance']:x} backend={self.backend} name={self.name} mvdelay={self.cfg['mvdelay']} typedelay={self.cfg['typedelay']} txfail=0"
             if cmd == "WAKE":
                 self.hid_awake = True
                 conn = 1 if (self.hid is None or getattr(self.hid, "connected", True)) else 0
                 return f"OK wake conn={conn} hid={'on' if conn else 'waking'}"
             if cmd == "SLEEP":
                 if self.cfg["hididle"] == 0:
-                    return "ERR hididle=0 or pairing mode (appearance!=0)"
+                    return "ERR hididle=0 (always on)"
                 self.hid_awake = False
                 return "OK sleep"
             if cmd in ("MV", "BT", "CK", "LP", "WH", "KP", "KD", "KU", "TX", "CC"):
@@ -373,7 +337,7 @@ class FirmwareModel:
             if cmd == "CFG":
                 k = toks[1].lower()
                 if k in self.cfg:
-                    self.cfg[k] = int(toks[2])
+                    self.cfg[k] = int(toks[2], 0)
                 elif k == "name":
                     self.name = " ".join(toks[2:])
                 else:

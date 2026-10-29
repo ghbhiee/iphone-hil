@@ -44,8 +44,15 @@ esptool.py --chip esp32 --port /dev/cu.usbserial-XXXX --baud 460800 write_flash 
    原因：和 iPhone 的蓝牙绑定密钥、`CFG` 配置、BLE 口令都存在 NVS 分区里，整盘刷会清掉，iPhone 就一直连不上，
    只能到 iPhone 蓝牙里「忘记此设备」重新配对。
 
-   刷到 0.3.0 以后，板子空闲 2 分钟会**主动放开 iPhone**（iPhone 设置→蓝牙里 HIL-Bridge 显示「未连接」是正常的），
-   再用时要在 iPhone 设置→蓝牙里点一下 HIL-Bridge，见下面「空闲时放开 iPhone」。
+   **`CFG unbond all` 一直回 `removed=1 left=1`（删不掉）= NVS 里的绑定区坏了**（反复刷固件/改外观后出现过两次），
+   症状是 iPhone 蓝牙里看得到却连不上、或连上后 HID 输入全被无视。修法：擦 NVS、写回口令、重新配对：
+
+```bash
+esptool --chip esp32 --port /dev/cu.usbserial-XXXX --baud 460800 erase-region 0x9000 0x5000   # NVS 分区
+# 串口：CFG token <原口令>（hil.json 的 ble_token），其余配置都回默认（appearance=0x3C2 parkadv=1 hididle=600）
+```
+
+   然后 iPhone 上「忽略此设备」，按下面「iPhone 配对」重新配。
 
 ## 方法 B：arduino-cli 自己编（改了源码）
 
@@ -81,8 +88,8 @@ screen /dev/cu.usbserial-XXXX 115200      # 退出：Ctrl-A 然后 K
 1. 设置 → 辅助功能 → 触控 → **辅助触控 → 打开**。iPhone 只有开了它才会显示鼠标指针、接受指点设备。
 2. 同一页 → **设备 → 蓝牙设备** → 搜到 **HIL-Bridge** → 配对（Just Works，无 PIN）。
    固件串口会打 `# connected`，`ST` 的 `conn=1`。第一个订阅鼠标报告的设备地址会被固件记住（`hidpeer`），以后只给它发 HID。
-   **固件 ≥0.3.0 配对时板子不能睡**：串口 `CFG appearance 0x3C2` 重启（配对模式下板子不睡、一直广播），
-   或者 `WAKE` 后 120 s 内完成配对。配完 `CFG appearance 0` 重启，板子就回到「空闲放开 iPhone」的正常行为。
+   固件 0.3.3 默认 `appearance=0x3C2`、`parkadv=1`：板子始终以蓝牙键盘身份广播，iPhone 随时看得到、点得着，不用切什么模式。
+   （iPhone 的「设置 → 蓝牙」页里点 HIL-Bridge 配对也行，效果一样。）
 3. 设置 → 辅助功能 → **指针控制**：
    - **颜色**：选 App 里少见的颜色（红/橙），之后用 `python -m hil pointer-sample 帧.png x y` 从截图采样生成识别阈值；
    - **指针大小**：调大一点，识别更稳；
@@ -94,27 +101,32 @@ screen /dev/cu.usbserial-XXXX 115200      # 退出：Ctrl-A 然后 K
 7. iPhone 用数据线接 Mac，解锁、点「信任此电脑」。Mac 的 QuickTime「新建影片录制」能选到 iPhone，就说明采集通道通了。
 
 ### 换 iPhone / 多台设备
-- 给**另一台** iPhone 配对：固件默认广播通用外观，有的 iOS 版本在蓝牙列表里不显示它；串口 `CFG appearance 0x3C2` 重启后再配，配完 `CFG appearance 0` 改回去（通用外观是为了防止 Mac 自动配对接管）。
+- 给**另一台** iPhone 配对：板子默认就以键盘身份广播，直接配；旧固件留下的 `appearance=0` 要先 `CFG appearance 0x3C2`（立刻生效，不用重启）。
 - 换 HID 目标：`CFG hidpeer clear`，再让新 iPhone 配对一次。
 - 删掉 Mac 误配对留下的绑定：`CFG unbond others`（保留 iPhone），`CFG unbond all`（全删）。
 
-## 空闲时放开 iPhone（固件 ≥0.3.2）
+## 空闲时放开 iPhone（固件 0.3.3）
 
-iOS 只要连着一个蓝牙键盘，就把**所有 App 的屏幕键盘**藏起来。板子以前常年挂在 iPhone 上，用户在手机上就再也弹不出键盘。
-现在（0.3.2）——目标是**只断开不用的 HID 连接让键盘恢复，绝不把板子自己变成不可达**：
+iOS 只要连着一个蓝牙键盘，就把**所有 App 的屏幕键盘**藏起来。板子对 iPhone 来说就是蓝牙键盘。
 
-- `hididle` 秒（默认 120）没有需要 HID 的命令（MV/CK/KP/TX/CC …）→ 断开 iPhone 的 HID（**不清绑定**），键盘恢复。
-  板子**继续广播**（始终可被 Mac/用户连上）。这个状态叫 parked。`SLEEP` 立刻进入；`hil stop` 退出时会发。
-- parked 期间 iPhone 若自己连回来，板子会再把它断开——否则 iOS 一重连键盘又被藏。所以 parked 时键盘一直在。
-- 要用板子操作手机：**实测被 parked 踢开后 iOS 不会因 `WAKE` 自动重连**（外设没法强迫 iPhone 来连）。可靠做法是工具层把板子切「侦听模式」（`CFG appearance 0x3C2` 重启，以蓝牙键盘身份广播），由**用户手工在设置→蓝牙点 HIL-Bridge**连上——`hil up`/`hil listen` 会自动做并提示。详见 `docs/IOS_RECONNECT_HANDOFF.md`。
-- **板子永远在广播，所以守护进程退出后新起一个也能连上**（不像旧版会变不可达）。只有板子断电/死机才连不上，那时才需要断电重启。
-- `ST` 里看：`hid=on`（iPhone 连着）/ `idle`（parked，已放开）/ `waking`（刚退出 parked 等 iPhone 连）；`idle=` 距上次活动秒数，`conns=` 连接数，`adv=pub|off`（off 只在两个连接占满时）。
-- 不想要这个行为：`CFG hididle 0`（一直连着，旧行为）；改时限：`CFG hididle 300`。配对模式（appearance≠0）下不进 parked。
-- 验证：`python -m hil normal`（切正常模式 + SLEEP）后，任意 App 输入框能弹出屏幕键盘，板子串口 `conn=0 hid=idle`、仍 `adv=pub`；
-  再 `python -m hil up`（会切侦听模式并提示）→ 用户在 iPhone 设置→蓝牙点 HIL-Bridge → 报「iPhone HID 已连」。
-- 串口 `RESTART` = 硬复位（等于断电重启，绑定/配置都在）。
-- 历史：0.3.0/0.3.1 曾在空闲时**停止广播**（甚至静默 90 s），结果板子对外不可达——守护进程退出后再也连不上、只能断电重启，等于「自杀」。
-  0.3.2 改为「断 HID 但一直广播 + parked 时踢掉 iPhone 的回连」，既让键盘恢复又保证板子始终可达。
+- `hididle` 秒（默认 600）没有需要 HID 的命令（MV/CK/KP/TX/CC …）→ 断开 iPhone 的 HID（**不清绑定**），进入 parked。`SLEEP` 立刻进入。
+  板子**始终在广播**，始终可被 Mac/用户连上。
+- parked 后怎么广播、iPhone 回连怎么办，由 `parkadv` 决定（`CFG parkadv 0|1`，立刻生效）：
+  - **`parkadv=1`（默认）**：照样以键盘身份广播，iPhone 回连就接受并醒来。实测 iPhone **0.3 s 内就自己连回来**，
+    所以空闲踢只是让连接跳一下，**屏幕键盘仍被占着**；好处是板子重启/被踢后 iPhone 都自动连回，工具随时能用。
+  - **`parkadv=0`**：只播指令服务，iPhone 回连就踢（iOS 被踢几轮、约 6 s 后放弃），**屏幕键盘稳定可用**；
+    代价是之后 `WAKE` **叫不回** iPhone（实测 70 s+ 不回连），要用时得 `WAKE` 后让用户在 iPhone「设置 → 蓝牙」点 HIL-Bridge。
+  - 结论：在 iOS 上「板子随时能操作（自动连回）」和「空闲放开屏幕键盘」互斥，`parkadv` 让你二选一。
+    iOS 的蓝牙设置里**没有「断开连接」**（只有「忽略此设备」），所以 parkadv=1 下想临时要回键盘：`CFG parkadv 0` + `SLEEP`，
+    或给板子断电，或在 iPhone 上关蓝牙。
+- `ST` 里看：`hid=on`（iPhone 连着）/ `idle`（parked）/ `waking`（醒了、等 iPhone 连）；`parkadv=`、`appear=`、`idle=` 距上次活动秒数、
+  `conns=` 连接数、`adv=pub|off`（off 只在 iPhone + Mac 两个连接占满时）。
+- 一直连着、永不踢：`CFG hididle 0`；改时限：`CFG hididle 300`。
+- 串口 `RESTART` = 硬复位（等于断电重启，绑定/配置都在）。CH340 板子在 macOS 上**每次打开串口也会复位一次**。
+- 已知副作用：板子带 HID 外观广播时，Mac 的链路守护进程（BLE）连上后约 30 s macOS 会试着自动配对它、失败超时，
+  这段时间指令通道会卡顿/断一次；`hil up` 会等过去。Mac 系统设置里别去配对 HIL-Bridge。
+- 历史：0.3.0/0.3.1 空闲时停止广播→板子不可达；0.3.2 改为「断 HID 但一直广播」，但默认 `appearance=0`，iPhone 被踢后看不到、连不回，
+  只能靠工具层「切 appearance + RESTART」进侦听模式；0.3.3 把广播内容改成随时按配置重建（不用重启），默认改为以键盘身份广播 + parkadv。
 
 ## 常用硬件键盘快捷键（iOS）
 

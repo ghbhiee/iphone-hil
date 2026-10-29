@@ -27,13 +27,15 @@ Mac→ESP32 一条命令中位 30 ms、连发 200 条零失败。第一个真实
 > iOS 只要连着**任何一个蓝牙键盘**，就把所有 App 里的屏幕软键盘藏起来——而板子对手机来说就是一个蓝牙键盘。
 > 所以「板子一直连着手机」会让你自己没法在手机上打字。本项目**不**让它一直连着，就是为了解决这个问题。
 >
-> **2. 板子会自动「休眠」放开手机，键盘就回来了。**
-> 不用工具时板子处于正常模式，空闲 **120 秒**没收到操作命令，就主动断开和 iPhone 的蓝牙连接，你的屏幕键盘**立刻恢复**，正常用手机。
-> 想马上放开：`hil stop` 或 `hil normal`。板子断电也不影响——它只是个蓝牙外设，平时插个充电头待命即可。
+> **2. 板子空闲会放开手机，但 iPhone 会马上自己连回来（默认设置下）。**
+> 板子空闲 **600 秒**没收到操作命令就断开 iPhone；可默认设置（`parkadv=1`）下板子始终以键盘身份广播，iPhone 0.3 秒内就自己连回来，
+> 所以屏幕键盘**基本一直被占着**。这是 iOS 的硬限制：「板子随时能操作（自动连回）」和「放开屏幕键盘」只能二选一。
+> 想要回键盘：`hil send 'CFG parkadv 0'` 再 `hil normal`（板子踢开 iPhone 且不让它回连），或者给板子断电、或者 iPhone 上关蓝牙。
+> iOS 的蓝牙设置里**没有「断开连接」**，只有「忽略此设备」（那会删掉配对，别点）。
 >
-> **3. 每次要用，得你手工连一下蓝牙（iOS 不让外设自动连回来）。**
-> 这是 iOS 的硬限制：手机（主控）才能决定连谁，板子（外设）没法自己把手机连回来，软件也叫不动。
-> 所以每次开始用时，工具（`hil up`）会把板子切到「可连」状态并提示你：到 iPhone **设置 → 蓝牙**，点一下名为 **`HIL-Bridge`** 的设备连上，就能用了。连上后用工具期间不会中途断；用完 `hil stop` 放开，键盘恢复。
+> **3. 连不上时，到 iPhone「设置 → 蓝牙」点一下 HIL-Bridge。**
+> 默认设置下板子重启、被空闲踢开后 iPhone 都会自己连回，`hil up` 一般直接报「已连」。
+> 但 iPhone 锁屏时 iOS 不回连蓝牙键盘；切过 `parkadv=0` 之后 iOS 也不再自己回连——这时 `hil up` 会提示你手工点一下。
 
 ---
 
@@ -141,7 +143,9 @@ iPhone 唯一的接口被 Mac 的采集线占了，所以鼠标键盘只能走�
 2. **一个 Nordic UART 风格的自定义指令服务**（RX 写入 / TX 通知），Mac 连上后先 `AUTH <口令>`，然后发文本命令：`MV dx dy`、`CK`、`LP ms`、`WH n`、`KP GUI+H`、`TX hello`、`CC HOME`……每条命令回一行 `OK` / `ERR`。完整协议见 [docs/PROTOCOL.md](docs/PROTOCOL.md)。
 3. **两个连接并存**：一个给 iPhone（HID，已绑定、按地址锁定），一个给 Mac（指令，不配对、靠口令）。没满两个就继续广播。
 
-这样 ESP32 平时只要插一个充电头。Mac 端用 CoreBluetooth 连它（`hil/ble_central.py`），不需要在系统设置里配对——而且**不能**配对，否则 macOS 会把它当成自己的鼠标键盘接管。为此固件广播通用外观（appearance 0）而不是 HID 外观，并把 HID 目标锁定为第一台订阅鼠标报告的设备（iPhone）。
+这样 ESP32 平时只要插一个充电头。Mac 端用 CoreBluetooth 连它（`hil/ble_central.py`），不需要在系统设置里配对——而且**不能**配对，否则 macOS 会把它当成自己的鼠标键盘接管。固件把 HID 目标锁定为第一台订阅鼠标报告的设备（iPhone），别的设备来订阅 HID 一律踢掉。
+（固件 0.3.3 默认以 HID 外观 `0x3C2` 广播——不这样 iPhone 在设置里看不到它；副作用是 Mac 的链路守护进程连上后约 30 s，
+macOS 会试着自动配对、失败超时，这段时间指令通道会卡一下，`hil up` 会等过去。）
 
 串口（USB 数据线接板子）仍保留，用于刷固件、读口令、改配置。
 
@@ -185,11 +189,17 @@ tests/                 协议 / 固件模型 / 定位闭环（仿真）
 
 两个 `.app` 都是**按需拉起、空闲 10 分钟自动退出**的常驻服务：任何一条 `hil` 命令发现服务没起就会 `open -g` 它，取帧和蓝牙各约 2 秒就绪。取帧服务只把「取帧」算作活动，链路服务只把「发命令」算作活动，单纯查状态不续命。资源本身很小（合计约 30 MB 内存、CPU 接近 0），自动退出主要是省 iPhone 的电——采集在跑时手机一直在做镜像输出。
 
-板子侧也有空闲（固件 0.3.2 起）：**120 秒没收到操作命令就断开 iPhone 的 HID 连接，让手机键盘恢复**。原因是 iOS 只要连着一个蓝牙键盘就把所有 App 的屏幕键盘藏起来——板子常年挂在手机上，用户自己就再也弹不出键盘。
+板子侧也有空闲（固件 0.3.3）：**600 秒没收到操作命令就断开 iPhone 的 HID 连接**，好让手机键盘恢复。原因是 iOS 只要连着一个蓝牙键盘就把所有 App 的屏幕键盘藏起来。
 
-**连接是「软件开侦听 + 用户手工点」（重要）**：iOS 的蓝牙 HID 由 iPhone（central）决定连谁，板子（peripheral）无法强迫它来连；板子一旦主动断开 iPhone，iOS 就进重连退避，**软件无论怎么广播都叫不回来**（`docs/IOS_RECONNECT_HANDOFF.md` 有实测与底层约束）。可靠的办法只有一个：板子**以蓝牙键盘身份广播**（固件 `appearance=0x3C2`，和平时防 macOS 抢用的 `appearance=0` 相对），iPhone 才在设置→蓝牙里可见可连，由**用户手工点一下 HIL-Bridge**连上。
+**但能不能真的放开键盘，取决于 `parkadv`**（iOS 的蓝牙 HID 由 iPhone 决定连谁，板子没法挑「什么时候让它回来」）：
+- `parkadv=1`（默认，「随时能连」）：板子始终以蓝牙键盘身份广播（`appearance=0x3C2`），iPhone 被踢开后 0.3 s 就自己连回来，
+  板子重启后也 1 s 内连回。工具随时能用；代价是屏幕键盘基本一直被占着。
+- `parkadv=0`（「键盘优先」）：空闲后只播指令服务，iPhone 回连就踢，约 6 s 后 iOS 放弃，屏幕键盘稳定可用；
+  代价是之后软件（`WAKE`）叫不回 iPhone，每次要用都得在 iPhone「设置 → 蓝牙」手工点一下 HIL-Bridge。
 
-于是工作流是：平时板子正常模式（`appearance=0`，空闲踢 iPhone 放键盘）→ 要用时 `hil up`（iPhone 没连会自动切侦听模式并提示）或 `hil listen` 切侦听、用户手工点连上 → 连上后侦听模式不会再中途踢它 → 用完 `hil normal` / `hil stop`（或空闲 10 分钟服务退出）切回正常模式、松开 iPhone、屏幕键盘恢复。时限用串口 `CFG hididle <秒>` 改（见 `firmware/FLASH.md`）。
+实测这两者互斥（`docs/IOS_RECONNECT_HANDOFF.md` 有前因）。工作流：`hil up` 拉起服务并 `WAKE`，iPhone 连着就直接用，没连就提示用户去设置里点；
+`hil normal` / `hil stop`（或空闲 10 分钟服务退出）发 `SLEEP` 松开 iPhone——parkadv=1 时它会马上连回，`hil normal` 会照实告诉你并给出放开键盘的办法。
+`hididle`、`parkadv` 用 `hil send 'CFG …'` 改，立刻生效（见 `firmware/FLASH.md`）。
 
 ---
 
@@ -308,9 +318,9 @@ python -m hil type "ascii"         # ASCII 文本（先确认 iPhone 在英文�
 python -m hil key GUI+H            # 组合键；GUI+SPACE 打开 Spotlight
 python -m hil home                 # 回主屏
 python -m hil goto X Y             # 只把指针挪过去不点（滚轮要落在列表上时用）
-python -m hil listen               # 把板子切侦听模式（以键盘身份广播），提示用户去设置→蓝牙手工点 HIL-Bridge
-python -m hil normal               # 切回正常模式：松开 iPhone、屏幕键盘恢复（用完收尾用）
-python -m hil status / up / stop   # 两个服务 + 固件状态 / 拉起(iPhone 没连会自动开侦听) / 立刻停(并切回正常模式)
+python -m hil listen               # WAKE 并等 iPhone 连上；连不上提示用户去设置→蓝牙点 HIL-Bridge
+python -m hil normal               # SLEEP 松开 iPhone；parkadv=1 时它会马上连回，会提示怎么放开键盘
+python -m hil status / up / stop   # 两个服务 + 固件状态 / 拉起并等 iPhone 连上 / 立刻停(退出前 SLEEP)
 python -m hil run script.txt       # 一行一个动作，走 Runner（每步存帧 + log.jsonl）
 python -m hil step                 # 交互式：人来当大脑
 ```
@@ -356,7 +366,7 @@ Claude 会自己 `hil up`、截图、点、再截图，并在要密码 / 付款 
 
 ## 11. 已知限制与待做
 
-- **板子连着时，你自己弹不出手机屏幕键盘；要你手工连蓝牙才能用。** 见开头「用之前先知道这三点」：iOS 把蓝牙键盘连着时会藏掉所有软键盘，所以平时让板子休眠放开手机（空闲 120 s 自动放开，或 `hil stop`）；每次要用时到 iPhone 设置→蓝牙手工点一下 `HIL-Bridge` 连上（iOS 不让外设自动连回来，这条做不到自动化，细节见 `docs/IOS_RECONNECT_HANDOFF.md`）。
+- **板子连着时，你自己弹不出手机屏幕键盘；「随时能操作」和「放开键盘」只能二选一。** 见开头「用之前先知道这三点」：iOS 把蓝牙键盘连着时会藏掉所有软键盘。默认 `parkadv=1` 板子空闲 600 s 会踢开 iPhone，但 iPhone 马上自己连回来；`parkadv=0` 能真正放开键盘，但之后得在 iPhone 设置→蓝牙手工点 `HIL-Bridge` 才能再用（外设没法让 iPhone 来连，细节见 `firmware/FLASH.md`「空闲时放开 iPhone」）。
 - **中文输入走通用剪贴板，慢但可用。** 蓝牙键盘只发 ASCII；非 ASCII 用 `paste`：Mac `pbcopy` → 通用剪贴板 → iPhone 上 ⌘V，两端都要开「接力」。实测 iPhone 是收到 ⌘V 时才去拉 Mac 的剪贴板，而且要先收到 Mac 的蓝牙广播：复制后等 2 s 常常落空（什么都不粘），4~5 s 才稳；Mac 上的复制 2 分钟后过期。所以 `paste` 每次重新复制、默认等 5 s，粘贴后要截图确认，没出来隔 3 s 再发一次 ⌘V。能走列表、索引栏、菜单就不输入。
 - **滚轮负方向无效**（往上翻不动，原因待查），往上用 `drag` 或方向键。
 - 中文拼音键盘会把字母吃进拼音合成、把数字当候选；`type` 前要切到英文键盘（`key CTRL+SPACE` 轮换后看截图确认）。

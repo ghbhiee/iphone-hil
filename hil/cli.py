@@ -24,6 +24,12 @@ import time
 from hil import config as C
 
 
+PHONE_HINT = "请解锁 iPhone，到「设置 → 蓝牙」点一下 HIL-Bridge。"
+RELEASE_HINT = ("iOS 没有「断开连接」，只能：`hil send 'CFG parkadv 0'` 再 `hil normal`（板子踢开 iPhone 且不让它回连，"
+                "屏幕键盘恢复；之后 WAKE 叫不回 iPhone，下次要用先 `hil send 'CFG parkadv 1'` 再 `hil listen`，按提示在 iPhone「设置 → 蓝牙」点 HIL-Bridge）；"
+                "或给板子断电；或在 iPhone 上关掉蓝牙。")
+
+
 def _log(s):
     print(s, file=sys.stderr)
 
@@ -101,8 +107,8 @@ def main(argv=None):
     p = sub.add_parser("move"); p.add_argument("dx", type=int); p.add_argument("dy", type=int)
     p = sub.add_parser("click"); p.add_argument("btn", nargs="?", default="l")
     sub.add_parser("release"); sub.add_parser("park"); sub.add_parser("home")
-    sub.add_parser("listen", help="把板子切到侦听模式（以蓝牙键盘身份广播），提示用户去 iPhone 设置→蓝牙手工连 HIL-Bridge")
-    sub.add_parser("normal", help="把板子切回正常模式（不广播 HID 身份，空闲自动踢 iPhone 让屏幕键盘恢复）")
+    sub.add_parser("listen", help="唤醒板子并等 iPhone 连上；连不上会提示用户去 iPhone 设置→蓝牙 点 HIL-Bridge")
+    sub.add_parser("normal", help="让板子立刻松开 iPhone；parkadv=1 时 iPhone 通常马上又连回来，这时会提示怎么放开屏幕键盘")
     p = sub.add_parser("calib"); p.add_argument("--steps", default="4,12,32,64,127")
     p = sub.add_parser("send"); p.add_argument("line")
     p = sub.add_parser("run"); p.add_argument("script"); p.add_argument("--max-steps", type=int, default=50)
@@ -116,18 +122,28 @@ def main(argv=None):
         from hil.client import ensure_server
         print(json.dumps(ensure_server(), ensure_ascii=False, indent=1)); return 0
     if a.cmd in ("listen", "normal"):
-        from hil.link import set_adv_mode, listen_and_wait
-        port = C.load().get("port")
-        if a.cmd == "normal":
-            st = set_adv_mode(False, port=port)
-            print(f"板子已回正常模式（不以键盘身份广播；空闲 {st.get('hididle')} s 没操作命令就踢开 iPhone、屏幕键盘恢复）。")
-            return 0
-        st = listen_and_wait(port=port,
-                             prompt=lambda: print(">>> 板子已进侦听模式。请在 iPhone 设置→蓝牙 点一下 HIL-Bridge 连接。"))
+        from hil.link import open_link, wait_iphone
+        lk = open_link("serial")   # 经链路守护进程（没跑会自动拉起；它打开时就发 WAKE）
+        try:
+            if a.cmd == "normal":
+                r = lk.send("SLEEP")
+                if not r.ok:
+                    print(f"SLEEP 失败: {r.raw}"); return 1
+                time.sleep(2.0)   # parkadv=1 时 iOS 通常 1 s 内就自己连回来
+                st = lk.status()
+                if st.get("conn") == "1":
+                    print("板子松开过 iPhone，但 iPhone 马上又自己连回来了（parkadv=1：板子始终以键盘身份广播、接受回连）。"
+                          f"屏幕键盘仍被占着。要放开键盘：{RELEASE_HINT}")
+                else:
+                    print("板子已松开 iPhone，屏幕键盘恢复。要用时 `hil listen` 或直接发命令。")
+                return 0
+            st = wait_iphone(lk, prompt=lambda: print(f">>> {PHONE_HINT}"))
+        finally:
+            lk.close()
         if st.get("conn") == "1":
-            print("✅ iPhone 已连上（conn=1），可以用了。用完 `hil normal` 或 `hil stop` 让它恢复空闲踢开、放回屏幕键盘。")
+            print("✅ iPhone 已连上（conn=1），可以用了。连着时 iPhone 的屏幕键盘弹不出来；要放开键盘跑 `hil normal` 看提示。")
         else:
-            print("⌛ 还没连上。去 iPhone 设置→蓝牙点 HIL-Bridge；连上后直接用命令即可，或再跑一次 `hil listen`。")
+            print(f"⌛ 还没连上。{PHONE_HINT} 连上后直接用命令即可，或再跑一次 `hil listen`。")
         return 0
     if a.cmd in ("up", "stop"):
         import urllib.request
@@ -144,15 +160,11 @@ def main(argv=None):
                 ok = bool(get(f"http://127.0.0.1:{port}/quit", 3))
                 results[name] = ok
                 print(name, "stopped" if ok else "not running")
-            if results.get("link"):   # 链路守护进程退出时会自己把板子切回正常模式
-                print("板子会在守护进程退出时切回正常模式（iPhone 松开、屏幕键盘恢复）。")
-            else:   # 它没在跑：兜底直接切一下
-                try:
-                    from hil.link import set_adv_mode
-                    set_adv_mode(False, port=C.load().get("port"))
-                    print("板子已切回正常模式（iPhone 松开、屏幕键盘恢复）。")
-                except Exception as e:
-                    print("切回正常模式失败（板子串口没插？）:", e)
+            if results.get("link"):   # 链路守护进程退出前会发 SLEEP
+                print("链路守护进程退出前让板子松开了 iPhone；parkadv=1 时 iPhone 多半马上又连回来、屏幕键盘仍被占着。"
+                      f"要放开键盘：{RELEASE_HINT}")
+            else:
+                print("链路守护进程没在跑：板子空闲 hididle 秒后会自己松开 iPhone。")
             return 0
         from hil.client import ensure_server, RemoteGrabber
         cap = ensure_server()
@@ -169,35 +181,35 @@ def main(argv=None):
             print(f"capture: ok  {cap.get('device')} {cap.get('width')}x{cap.get('height')}")
         else:
             print("capture:", cap.get("hint") or cap.get("error") or "没有画面（iPhone 接线、解锁了吗？）")
-        # iPhone HID 连没连：先用直串口看；没连就切侦听模式让用户手工连。
-        # （板子被踢开后 iOS 不会自动重连、软件 WAKE 也叫不回来——只有板子以键盘身份广播 + 用户手工点才可靠）
-        from hil.link import open_link, SerialLink, listen_and_wait
-        port = C.load().get("port")
-        hid_note = "未知"
+        # 经链路守护进程（打开时就发 WAKE）等 iPhone 连上；iPhone 还绑着的话一般几秒内自己连回来，
+        # 被空闲踢过、iOS 没回连时只能让用户在 设置→蓝牙 点一下（外设没法强迫 iPhone 来连）。
+        from hil.link import open_link, wait_iphone
         try:
-            sl = SerialLink(port=port); st0 = sl.status(); sl.close()
-            if st0.get("conn") == "1":
-                hid_note = "已连"
-            else:
-                print(">>> iPhone 没连。把板子切到侦听模式，请在 iPhone 设置→蓝牙 点一下 HIL-Bridge（最多等 60s）…")
-                st0 = listen_and_wait(port=port)
-                hid_note = "已连" if st0.get("conn") == "1" else "未连（去 iPhone 设置→蓝牙点 HIL-Bridge；连上后直接用命令即可）"
-        except Exception as e:
-            hid_note = f"串口检查失败: {e}（板子 USB 插了吗？）"
-        try:
-            lk = open_link("serial")  # BLE 守护进程按名字连板子；侦听模式下命令服务仍在
+            lk = open_link("serial")
+            # BLE 链路刚连上的头 30~50 s 可能卡顿（macOS 看到 HID 外观会试着自动配对、失败超时），回复会迟到/错位：
+            # 只认带 fw= 的 ST 回复，没拿到就重试。
             fw = None
-            for _ in range(30):
+            for _ in range(60):
                 try:
-                    fw = lk.status(); break
+                    fw = lk.status()
+                    if fw.get("fw"):
+                        break
                 except Exception:
-                    time.sleep(1)
+                    pass
+                time.sleep(1)
             ds = lk.daemon_status()
             if fw:
+                if fw.get("conn") != "1":
+                    print(">>> 等 iPhone 连上（最多 60 s）…")
+                    st = wait_iphone(lk, prompt=lambda: print(f">>> {PHONE_HINT}"))
+                    fw = st if st.get("fw") else {**fw, "conn": st.get("conn", fw.get("conn"))}
+                hid_note = "已连" if fw.get("conn") == "1" else f"未连（{PHONE_HINT} 连上后直接用命令即可）"
                 print("link:", ds.get("transport"), ds.get("port"), "| 固件", fw.get("fw"), "| iPhone HID", hid_note)
                 hididle = fw.get("hididle")
                 if hididle and hididle != "0":
-                    print(f"用完 `hil normal` 或 `hil stop`：板子回正常模式、空闲 {hididle} s 没操作命令就踢开 iPhone，屏幕键盘恢复。再要用跑 `hil up`，按提示去设置→蓝牙点 HIL-Bridge 连上。")
+                    print(f"连着时 iPhone 的屏幕键盘弹不出来。板子空闲 {hididle} s 会松开 iPhone"
+                          + ("，但 parkadv=1 时 iPhone 会马上自己连回来；要放开键盘跑 `hil normal` 看提示。" if fw.get("parkadv") == "1"
+                             else "，iPhone 不会回连，键盘恢复（下次要用得在 iPhone 设置→蓝牙 点 HIL-Bridge）。"))
             else:
                 print("link:", ds.get("transport"), "ERROR", ds.get("error"))
         except Exception as e:

@@ -1,6 +1,25 @@
 # HANDOFF — iphone-hil（开发日志，2026-10-26 起）
 
-## 最新（2026-10-27 晚）：连接/放键盘的最终方案 = 「软件开侦听 + 用户手工点」，本文下面关于「WAKE 后 iPhone 1~3s 自动连回来」的说法已作废
+## 最新（2026-10-29）：固件 0.3.3 + parkadv，工具层去掉「切 appearance + RESTART」
+- **固件 0.3.3**：广播内容由 `updateAdvertising()` 按当前配置随时重建（改 appearance/parkadv/hididle、醒睡切换都不用重启）；
+  默认 `appearance=0x3C2`、`parkadv=1`、`hididle=600`；非 hidpeer 的 HID 订阅者直接踢掉。`firmware/prebuilt/esp32/hid_bridge.ino.bin` 已更新（编译洗过路径、扫过无个人信息）。
+- **真机结论**（同一块板子 + iPhone，2026-10-29）：
+  - parkadv=1：板子空闲 600 s 踢掉 iPhone，**iPhone 0.3 s 内自己连回**；板子重启后 ~1 s 连回。所以工具随时可用，但屏幕键盘基本一直被占着。
+  - parkadv=0：踢掉后 iPhone 被踢几轮（~6 s）就放弃，屏幕键盘稳定可用（用户确认）；但之后 `WAKE` 叫不回（70 s+ 不回连），只能用户在设置→蓝牙手工点。
+    （一次在 iOS 刚放弃 ~1 分钟内切 parkadv=1+WAKE 3 s 就回连了，复测不成立，不可靠。）
+  - 结论：「随时能操作（自动回连）」和「空闲放开屏幕键盘」在 iOS 上互斥；**用户选 parkadv=1**。iOS 蓝牙设置里没有「断开连接」，只有「忽略此设备」。
+  - 10-27 的「被踢后 iOS 不会自动重连」是在 appearance=0（不以键盘身份广播）时得出的；以 0x3C2 广播时 iOS 会积极回连。
+- **配对坏了的修法（第二次遇到）**：症状 iPhone 蓝牙里看得到但连不上 / 连上后 HID 输入全被无视；`CFG unbond all` 永远 `removed=1 left=1`。
+  `esptool erase-region 0x9000 0x5000` 擦 NVS → 串口 `CFG token <原口令>`（其余配置回默认）→ iPhone「忽略此设备」→ 关开一次 iPhone 蓝牙 → 设置→蓝牙「其他设备」里点 HIL-Bridge 配对。修好后指针/键盘真机通过。
+- **工具层**：删了 `link.set_adv_mode` / `listen_and_wait`，换成 `link.wait_iphone`（WAKE→轮询 ST→过 4 s 没连上就提示用户去设置里点）。
+  `hil up`/`listen` 经链路守护进程 WAKE 并等连上；`hil normal` 发 SLEEP 后 2 s 复查，iPhone 回连了就照实说、给出放键盘办法；
+  `hil stop`/守护进程退出前经同一条链路发 SLEEP（不再开串口、不再改 appearance/RESTART）；`link_server` 打开链路时恢复发 WAKE。
+- **已知问题**：BLE 守护进程连上板子后约 30 s，macOS 看到 HID 外观会试着自动配对（板子日志 `auth enc=0 bonded=0`），这段指令通道卡顿/断一次，
+  `hil up` 冷启动因此约 36~40 s（已做成等过去）。appearance=0 时没有这事，但那样 iPhone 看不到板子。没找到不靠 hack 的根治办法。
+- 坑：macOS 上 CH340 每次开串口都会复位板子（`POWERON_RESET`），`--link direct` 会让 iPhone 断一下。
+- 板子 NVS 擦过一次：如果以后发现 `hil.json` 的 `ble_token` 对不上，用串口 `ST` 看 `token=`。
+
+## 2026-10-27 晚（已被 10-29 取代，留作历史）：连接/放键盘的最终方案 = 「软件开侦听 + 用户手工点」，本文下面关于「WAKE 后 iPhone 1~3s 自动连回来」的说法已作废
 真机验证结论：**板子被 parked 踢开后，iOS 不会因 `WAKE` 自动重连**（BLE 外设不能强迫 iPhone 来连；板子主动断过后 iOS 进重连退避，怎么广播都勾不回来，实测 WAKE 后 90s 不回连、正常模式手工点也连不上）。可靠连接只有一条路：板子**以蓝牙键盘身份广播**（`CFG appearance 0x3C2`，平时用 `appearance=0` 防 macOS 抢），iPhone 才在设置→蓝牙可见，由用户**手工点 HIL-Bridge**。
 已纯工具层实现并真机端到端验证（没改固件）：`hil up`（iPhone 没连时）/ `hil listen` 经串口切侦听模式并提示用户手工点；`hil normal`/`hil stop`/空闲退出切回正常模式(`appearance=0`)+SLEEP，松开 iPhone、屏幕键盘恢复。连上后侦听模式 hidAlwaysOn 永不中途踢。改的文件：`hil/link.py`(`set_adv_mode`/`listen_and_wait`)、`hil/cli.py`(`listen`/`normal` + 改写 up/stop)、`hil/link_server.py`(退出切正常、去掉 open 时的 WAKE)。另：之前 iPhone 连不上还因为反复刷固件把 NVS 配对区搞坏（`unbond all` 永远 removed=1 left=1），已 `esptool erase-region 0x9000 0x5000` 擦 NVS、写回 token、干净重配修复。全量交接见 `docs/IOS_RECONNECT_HANDOFF.md`。
 
